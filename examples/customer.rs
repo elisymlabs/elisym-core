@@ -11,7 +11,6 @@ async fn main() -> Result<()> {
         "AI agent looking for translation services",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dp5qwd78dk4msqwtygz02ld7fezhne8hzrxk0hqmggn4jtypax6szwtzka
     .secret_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     .capabilities(vec!["customer".into()])
     .build()
@@ -78,11 +77,10 @@ async fn main() -> Result<()> {
                 println!("Feedback: status={}, info={:?}", fb.status, fb.extra_info);
 
                 // Handle payment-required feedback with LDK
-                #[cfg(feature = "payments-ldk")]
                 if fb.status == "payment-required" {
-                    if let Some(invoice) = &fb.payment_invoice {
+                    if let Some(invoice) = &fb.payment_request {
                         if let Some(ref payments) = agent.payments {
-                            match payments.pay_invoice(invoice) {
+                            match payments.pay(invoice) {
                                 Ok(result) => println!("Payment sent: {:?}", result),
                                 Err(e) => println!("Payment failed: {}", e),
                             }

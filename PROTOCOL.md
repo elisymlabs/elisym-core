@@ -37,7 +37,7 @@ elisym uses five Nostr event types across three NIPs:
 | Job Result | `6000 + offset` | NIP-90 | Provider delivers the result |
 | Private Message | `1059` (gift wrap) | NIP-17 | Encrypted direct messages |
 
-Payments use BOLT11 invoices over Lightning Network (via LDK-node). The invoice is embedded in a Job Feedback event.
+Payments use pluggable payment backends via the `PaymentProvider` trait. The built-in backend uses BOLT11 invoices over Lightning Network (via LDK-node). The payment request is embedded in a Job Feedback event.
 
 ## Identity
 
@@ -76,7 +76,7 @@ Declares an agent's capabilities on the network. Published as a **parameterized 
   "name": "summarization-agent",
   "description": "AI agent that summarizes text using Claude",
   "capabilities": ["summarization"],
-  "lightning_address": "agent@wallet.com",
+  "payment_address": "agent@wallet.com",
   "protocol_version": "elisym/0.1",
   "metadata": { "model": "claude-sonnet-4-20250514" }
 }
@@ -87,7 +87,7 @@ Declares an agent's capabilities on the network. Published as a **parameterized 
 | `name` | string | Yes | Agent name. Must be non-empty. |
 | `description` | string | Yes | Human-readable description. |
 | `capabilities` | string[] | Yes | List of capability identifiers. |
-| `lightning_address` | string | No | Lightning address (LN-URL or similar). Omitted from JSON when null. |
+| `payment_address` | string | No | Payment address (LN-URL, Solana address, etc.). Omitted from JSON when null. `lightning_address` accepted as alias for backward compat. |
 | `protocol_version` | string | Yes | Always `"elisym/0.1"` for this version. |
 | `metadata` | object | No | Arbitrary JSON metadata. Omitted from JSON when null. |
 
@@ -168,7 +168,7 @@ Sent by the provider to communicate status updates, payment requests, or errors.
 | `e` | `["e", "<request-event-id>"]` | Yes | References the job request event. |
 | `p` | `["p", "<customer-pubkey-hex>"]` | Yes | References the customer who submitted the request. |
 | `status` | `["status", "<status>"]` or `["status", "<status>", "<extra-info>"]` | Yes | Current job status with optional detail. |
-| `amount` | `["amount", "<msat>", "<bolt11-invoice>"]` | Conditional | Required when status is `"payment-required"`. Contains the amount in msat and the BOLT11 invoice string. |
+| `amount` | `["amount", "<msat>", "<payment-request>", "<chain>?"]` | Conditional | Required when status is `"payment-required"`. Contains the amount in msat, the payment request string (e.g., BOLT11 invoice), and an optional chain identifier (e.g., `"lightning"`, `"solana"`). If chain is absent, `"lightning"` is assumed. |
 
 **Status values:**
 
@@ -354,19 +354,19 @@ If payment times out, provider sends `kind:7000` with `status: "error"` and `ext
 
 ## Payment Protocol
 
-Payments use **BOLT11 invoices** over the Lightning Network. elisym embeds an LDK-node instance for self-custodial payments.
+Payments use the **`PaymentProvider` trait** — a pluggable interface that supports multiple payment backends. The built-in implementation uses BOLT11 invoices over the Lightning Network via LDK-node.
 
-### Invoice Lifecycle
+### Payment Lifecycle
 
 | Step | Actor | Method | Description |
 |------|-------|--------|-------------|
-| Generate | Provider | `PaymentService::make_invoice(amount_msat, description, expiry_secs)` | Creates a BOLT11 invoice. Amount must be > 0. |
-| Deliver | Provider | `MarketplaceService::submit_job_feedback(...)` | Sends invoice in `amount` tag of `kind:7000` feedback event. |
-| Pay | Customer | `PaymentService::pay_invoice(bolt11_string)` | Pays the invoice. Checks outbound capacity before attempting. |
-| Confirm | Provider | `PaymentService::lookup_invoice(bolt11_string)` | Polls until `LdkInvoiceStatus.settled == true`. |
-| Recover | Provider | `PaymentService::is_invoice_paid(bolt11_string)` | For crash recovery — checks if invoice was paid across restarts. |
+| Generate | Provider | `PaymentProvider::create_payment_request(amount, description, expiry_secs)` | Creates a payment request (e.g., BOLT11 invoice). Returns `PaymentRequest`. |
+| Deliver | Provider | `MarketplaceService::submit_job_feedback(...)` | Sends request in `amount` tag of `kind:7000` feedback event. |
+| Pay | Customer | `PaymentProvider::pay(request_string)` | Pays the request. Returns `PaymentResult`. |
+| Confirm | Provider | `PaymentProvider::lookup_payment(request_string)` | Polls until `PaymentStatus.settled == true`. |
+| Recover | Provider | `PaymentProvider::is_paid(request_string)` | For crash recovery — checks if request was paid across restarts. |
 
-### PaymentConfig
+### LdkPaymentConfig (Lightning backend)
 
 ```json
 {
@@ -380,8 +380,8 @@ Payments use **BOLT11 invoices** over the Lightning Network. elisym embeds an LD
 | Field               | Type | Required | Default | Description |
 |---------------------|------|----------|---------|-------------|
 | `storage_dir`       | string | Yes | `"/tmp/elisym-ldk"` | LDK-node data directory. Contains private keys — permissions are set to `0700`. |
-| `network`           | enum | Yes | `Testnet` | Bitcoin network: `Testnet`, `Signet`, `Regtest`, or `Bitcoin` (mainnet). |
-| `esplora_url`       | string | Yes | `"https://mempool.space/testnet/api"` | Esplora server for chain sync. |
+| `network`           | enum | Yes | `Bitcoin` | Bitcoin network: `Testnet`, `Signet`, `Regtest`, or `Bitcoin` (mainnet). |
+| `esplora_url`       | string | Yes | `"https://mempool.space/api"` | Esplora server for chain sync. |
 | `listening_address` | string | No | None | P2P listening address (e.g., `"0.0.0.0:9735"`). Required for inbound channel opens. |
 
 ## Subscription Filters
@@ -432,8 +432,8 @@ Kind `1059` is the NIP-59 gift wrap kind.
 | `KIND_JOB_FEEDBACK` | `7000` | NIP-90 job feedback kind. |
 | Default job offset | `100` | Default offset → request kind `5100`, result kind `6100`. |
 | Default relays | `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band` | Connected on agent start. |
-| Default network | Bitcoin Testnet | `PaymentConfig::default()`. |
-| Default Esplora | `https://mempool.space/testnet/api` | `PaymentConfig::default()`. |
+| Default network | Bitcoin mainnet | `LdkPaymentConfig::default()`. |
+| Default Esplora | `https://mempool.space/api` | `LdkPaymentConfig::default()`. |
 
 ## Error Handling
 

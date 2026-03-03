@@ -15,7 +15,7 @@ fn test_capability_card_roundtrip() {
         "A test agent for integration testing",
         vec!["capability-a".into(), "capability-b".into()],
     );
-    card.set_lightning_address("test@wallet.example.com");
+    card.set_payment_address("test@wallet.example.com");
 
     let json = card.to_json().unwrap();
     let restored = CapabilityCard::from_json(&json).unwrap();
@@ -23,7 +23,7 @@ fn test_capability_card_roundtrip() {
     assert_eq!(restored.name, "test-agent");
     assert_eq!(restored.description, "A test agent for integration testing");
     assert_eq!(restored.capabilities.len(), 2);
-    assert_eq!(restored.lightning_address.as_deref(), Some("test@wallet.example.com"));
+    assert_eq!(restored.payment_address.as_deref(), Some("test@wallet.example.com"));
     assert_eq!(restored.protocol_version, PROTOCOL_VERSION);
 }
 
@@ -32,13 +32,13 @@ fn test_capability_card_without_optional_fields() {
     let card = CapabilityCard::new("minimal", "Minimal agent", vec![]);
     let json = card.to_json().unwrap();
 
-    // lightning_address and metadata should not be in JSON when None
-    assert!(!json.contains("lightning_address"));
+    // payment_address and metadata should not be in JSON when None
+    assert!(!json.contains("payment_address"));
     assert!(!json.contains("metadata"));
 
     let restored = CapabilityCard::from_json(&json).unwrap();
     assert_eq!(restored.name, "minimal");
-    assert!(restored.lightning_address.is_none());
+    assert!(restored.payment_address.is_none());
 }
 
 #[test]
@@ -82,13 +82,13 @@ fn test_protocol_version() {
 }
 
 #[test]
-fn test_capability_card_with_lightning_address_only() {
-    let mut card = CapabilityCard::new("ln-agent", "Agent with lightning address", vec![]);
-    card.set_lightning_address("agent@wallet.com");
+fn test_capability_card_with_payment_address_only() {
+    let mut card = CapabilityCard::new("ln-agent", "Agent with payment address", vec![]);
+    card.set_payment_address("agent@wallet.com");
 
     let json = card.to_json().unwrap();
-    assert!(json.contains("lightning_address"));
+    assert!(json.contains("payment_address"));
 
     let restored = CapabilityCard::from_json(&json).unwrap();
-    assert_eq!(restored.lightning_address.as_deref(), Some("agent@wallet.com"));
+    assert_eq!(restored.payment_address.as_deref(), Some("agent@wallet.com"));
 }

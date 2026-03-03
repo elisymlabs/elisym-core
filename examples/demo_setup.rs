@@ -23,30 +23,28 @@ async fn main() -> Result<()> {
     let total_start = Instant::now();
 
     println!();
-    println!("  \u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}");
-    println!("  \u{2551}      elisym-core Demo: Channel Setup              \u{2551}");
-    println!("  \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}");
+    println!("  ╔═══════════════════════════════════════════════════╗");
+    println!("  ║      elisym-core Demo: Channel Setup              ║");
+    println!("  ╚═══════════════════════════════════════════════════╝");
     println!();
 
     // ── Step 1: Start both LDK nodes ──
     let step = Instant::now();
     println!("  [{}] [Step 1/4] Starting Lightning nodes...", ts());
 
-    let mut provider_payments = PaymentService::new(PaymentConfig {
+    let mut provider_payments = LdkPaymentProvider::new(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-provider".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9735".to_string()),
-        ..Default::default()
     });
     provider_payments.start().await?;
 
-    let mut customer_payments = PaymentService::new(PaymentConfig {
+    let mut customer_payments = LdkPaymentProvider::new(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-customer".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9736".to_string()),
-        ..Default::default()
     });
     customer_payments.start().await?;
 

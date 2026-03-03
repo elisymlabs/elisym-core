@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
         // Send processing feedback
         agent
             .marketplace
-            .submit_job_feedback(&job.raw_event, JobStatus::Processing, None, None, None)
+            .submit_job_feedback(&job.raw_event, JobStatus::Processing, None, None, None, None)
             .await?;
 
         // Simulate translation

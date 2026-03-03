@@ -95,9 +95,9 @@ async fn main() -> Result<()> {
     });
 
     println!();
-    println!("  \u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}");
-    println!("  \u{2551}       elisym-core Demo: AI Provider Agent         \u{2551}");
-    println!("  \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}");
+    println!("  ╔═══════════════════════════════════════════════════╗");
+    println!("  ║       elisym-core Demo: AI Provider Agent         ║");
+    println!("  ╚═══════════════════════════════════════════════════╝");
     println!();
 
     // ── Step 1: Start agent + Lightning node ──
@@ -109,18 +109,14 @@ async fn main() -> Result<()> {
         "AI agent that summarizes text using Claude",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dgz2hxxeu3m54kqxuvpdmh4k804pddwttu3raem50r5xrw6c86esxd0p6w
-    // To fund: run `cargo run --example demo_setup` — it prints the LDK on-chain address
-    // when balance is insufficient. Or use your own secret key.
     .secret_key("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     .capabilities(vec!["summarization".into()])
     .supported_job_kinds(vec![5100])
-    .payment_config(PaymentConfig {
+    .ldk_payment_config(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-provider".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9735".to_string()),
-        ..Default::default()
     })
     .build()
     .await?;
@@ -131,7 +127,7 @@ async fn main() -> Result<()> {
     let npub = provider.identity.npub();
     println!("             Agent pubkey: {}", npub);
     println!("             Nostr profile: https://njump.me/{}", npub);
-    if let Some(ref payments) = provider.payments {
+    if let Some(payments) = provider.ldk_payments() {
         let balance = payments.onchain_balance().unwrap_or(0);
         let channels = payments.list_channels().unwrap_or_default();
         let usable = channels.iter().filter(|c| c.is_usable).count();
@@ -183,6 +179,7 @@ async fn main() -> Result<()> {
             None,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -206,11 +203,13 @@ async fn main() -> Result<()> {
         .ok_or_else(|| ElisymError::Payment("Payments not configured".into()))?;
 
     // Snapshot balance before payment
-    let before_channels = payments.list_channels().unwrap_or_default();
+    let ldk = provider.ldk_payments().unwrap();
+    let before_channels = ldk.list_channels().unwrap_or_default();
     let before_outbound: u64 = before_channels.iter().filter(|c| c.is_usable).map(|c| c.outbound_capacity_msat / 1000).sum();
     let before_inbound: u64 = before_channels.iter().filter(|c| c.is_usable).map(|c| c.inbound_capacity_msat / 1000).sum();
 
-    let invoice = payments.make_invoice(JOB_PRICE_MSAT, "elisym summarization job", 3600)?;
+    let payment_req = payments.create_payment_request(JOB_PRICE_MSAT, "elisym summarization job", 3600)?;
+    let invoice = &payment_req.request;
     println!("             Invoice: {}...{}", &invoice[..30], &invoice[invoice.len() - 10..]);
 
     let feedback_event_id = provider
@@ -220,7 +219,8 @@ async fn main() -> Result<()> {
             JobStatus::PaymentRequired,
             None,
             Some(JOB_PRICE_MSAT),
-            Some(&invoice),
+            Some(invoice),
+            None,
         )
         .await?;
 
@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
     let mut paid = false;
     for _ in 0..120 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        match payments.lookup_invoice(&invoice) {
+        match payments.lookup_payment(invoice) {
             Ok(status) if status.settled => {
                 paid = true;
                 break;
@@ -253,6 +253,7 @@ async fn main() -> Result<()> {
                 Some("payment-timeout"),
                 None,
                 None,
+                None,
             )
             .await?;
         return Err(ElisymError::Payment("Payment timeout".into()));
@@ -260,7 +261,7 @@ async fn main() -> Result<()> {
 
     println!("             Payment confirmed! 1000 sats received");
     // Show balance change
-    let after_channels = payments.list_channels().unwrap_or_default();
+    let after_channels = ldk.list_channels().unwrap_or_default();
     let after_outbound: u64 = after_channels.iter().filter(|c| c.is_usable).map(|c| c.outbound_capacity_msat / 1000).sum();
     let after_inbound: u64 = after_channels.iter().filter(|c| c.is_usable).map(|c| c.inbound_capacity_msat / 1000).sum();
     println!("             Lightning outbound: {} -> {} sats (+{})", before_outbound, after_outbound, after_outbound.saturating_sub(before_outbound));
@@ -311,4 +312,3 @@ fn fmt_duration(d: Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     }
 }
-

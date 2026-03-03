@@ -1,7 +1,7 @@
 //! # elisym-core
 //!
 //! Rust SDK for AI agents to discover each other via [Nostr](https://github.com/nostr-protocol/nips)
-//! and pay for task execution via the [Lightning Network](https://lightning.network/).
+//! and pay for task execution via pluggable payment backends.
 //!
 //! ## Overview
 //!
@@ -11,8 +11,8 @@
 //! - **Discovery** — publish and search agent capabilities using NIP-89 (kind:31990)
 //! - **Marketplace** — submit and receive jobs using NIP-90 Data Vending Machines
 //! - **Messaging** — encrypted private messages via NIP-17 (NIP-44 + NIP-59 gift wrap)
-//! - **Payments** — self-custodial Lightning via LDK-node: BOLT11 invoices, on-chain,
-//!   and channel management (feature-gated behind `payments-ldk`)
+//! - **Payments** — pluggable payment providers via the [`PaymentProvider`] trait.
+//!   Built-in: Lightning via LDK-node (feature-gated behind `payments-ldk`)
 //!
 //! ## Quick Start
 //!
@@ -37,10 +37,8 @@ pub mod identity;
 pub mod discovery;
 pub mod messaging;
 pub mod marketplace;
+pub mod payment;
 pub(crate) mod dedup;
-
-#[cfg(feature = "payments-ldk")]
-pub mod payments;
 
 pub use error::{ElisymError, Result};
 pub use types::*;
@@ -48,9 +46,10 @@ pub use identity::{AgentIdentity, CapabilityCard};
 pub use discovery::{DiscoveryService, DiscoveredAgent, AgentFilter};
 pub use messaging::MessagingService;
 pub use marketplace::MarketplaceService;
+pub use payment::{PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus, PaymentChain, FeeConfig};
 
 #[cfg(feature = "payments-ldk")]
-pub use payments::{PaymentService, PaymentConfig, ChannelInfo};
+pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
 
 use nostr_sdk::Client;
 
@@ -61,27 +60,31 @@ pub struct AgentNode {
     pub discovery: DiscoveryService,
     pub messaging: MessagingService,
     pub marketplace: MarketplaceService,
-    #[cfg(feature = "payments-ldk")]
-    pub payments: Option<PaymentService>,
+    /// Pluggable payment provider (Lightning, Solana, etc.).
+    pub payments: Option<Box<dyn PaymentProvider>>,
+    /// Optional fee configuration for app developer + platform fees.
+    pub fee_config: Option<FeeConfig>,
     pub capability_card: CapabilityCard,
 }
 
 impl AgentNode {
-    /// Gracefully shut down the agent: disconnect from relays and stop the
-    /// payment node (if running). Disconnecting the client causes all spawned
+    /// Gracefully shut down the agent: disconnect from relays and drop the
+    /// payment provider (if running). Disconnecting the client causes all spawned
     /// subscription tasks to terminate.
     ///
     /// **Note:** Callers should drain any active `mpsc::Receiver` channels
     /// before calling shutdown to process remaining buffered events.
     pub async fn shutdown(&mut self) {
         let _ = self.client.disconnect().await;
-
-        #[cfg(feature = "payments-ldk")]
-        if let Some(ref mut payments) = self.payments {
-            payments.stop();
-        }
-
+        self.payments = None;
         tracing::info!("AgentNode shut down");
+    }
+
+    /// Downcast the payment provider to [`LdkPaymentProvider`] for LDK-specific operations
+    /// (channel management, on-chain, etc.).
+    #[cfg(feature = "payments-ldk")]
+    pub fn ldk_payments(&self) -> Option<&payment::ldk::LdkPaymentProvider> {
+        self.payments.as_ref()?.as_any().downcast_ref()
     }
 
     /// Process a job with payment enforcement: generate invoice, send
@@ -89,7 +92,8 @@ impl AgentNode {
     ///
     /// This is the **recommended** way for providers to deliver paid results.
     /// Calling `submit_job_result()` directly skips payment verification.
-    #[cfg(feature = "payments-ldk")]
+    ///
+    /// If a [`FeeConfig`] is set, the invoice amount is increased to include fees.
     pub async fn process_job_with_payment(
         &self,
         job: &marketplace::JobRequest,
@@ -104,14 +108,23 @@ impl AgentNode {
             .as_ref()
             .ok_or_else(|| ElisymError::Payment("Payments not configured".into()))?;
 
-        // 1. Generate BOLT11 invoice
-        let invoice = payments.make_invoice(
-            amount_msat,
+        // Apply fee calculation if configured
+        let invoice_amount = if let Some(ref fee_config) = self.fee_config {
+            let (total, _app_fee) = fee_config.calculate(amount_msat);
+            total
+        } else {
+            amount_msat
+        };
+
+        // 1. Generate payment request (invoice)
+        let payment_request = payments.create_payment_request(
+            invoice_amount,
             invoice_description,
             invoice_expiry_secs,
         )?;
 
-        tracing::info!(amount_msat, "Generated invoice for job payment");
+        let chain_str = payment_request.chain.to_string();
+        tracing::info!(amount_msat = invoice_amount, chain = %chain_str, "Generated payment request for job");
 
         // 2. Send payment-required feedback with invoice
         self.marketplace
@@ -119,8 +132,9 @@ impl AgentNode {
                 &job.raw_event,
                 JobStatus::PaymentRequired,
                 None,
-                Some(amount_msat),
-                Some(&invoice),
+                Some(invoice_amount),
+                Some(&payment_request.request),
+                Some(&chain_str),
             )
             .await?;
 
@@ -137,14 +151,17 @@ impl AgentNode {
                         Some("payment-timeout"),
                         None,
                         None,
+                        None,
                     )
                     .await;
-                return Err(ElisymError::Payment("Payment timeout — result not delivered".into()));
+                return Err(ElisymError::Payment(
+                    "Payment timeout — result not delivered".into(),
+                ));
             }
 
-            match payments.lookup_invoice(&invoice) {
+            match payments.lookup_payment(&payment_request.request) {
                 Ok(status) if status.settled => {
-                    tracing::info!(amount_msat, "Payment confirmed");
+                    tracing::info!(amount_msat = invoice_amount, "Payment confirmed");
                     break;
                 }
                 _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
@@ -152,14 +169,11 @@ impl AgentNode {
         }
 
         // 4. Payment confirmed — deliver result with retries.
-        //    This is critical: payment was received, so we must make best effort
-        //    to deliver. If all retries fail, the caller should persist the result
-        //    and retry later (use `is_invoice_paid()` on restart to check).
         let mut last_err = None;
         for attempt in 0..3u32 {
             match self
                 .marketplace
-                .submit_job_result(&job.raw_event, result_content, Some(amount_msat))
+                .submit_job_result(&job.raw_event, result_content, Some(invoice_amount))
                 .await
             {
                 Ok(event_id) => return Ok(event_id),
@@ -186,7 +200,8 @@ pub struct AgentNodeBuilder {
     supported_job_kinds: Vec<u16>,
     secret_key: Option<String>,
     #[cfg(feature = "payments-ldk")]
-    payment_config: Option<PaymentConfig>,
+    ldk_payment_config: Option<payment::ldk::LdkPaymentConfig>,
+    fee_config: Option<FeeConfig>,
 }
 
 impl AgentNodeBuilder {
@@ -199,7 +214,8 @@ impl AgentNodeBuilder {
             supported_job_kinds: vec![5100],
             secret_key: None,
             #[cfg(feature = "payments-ldk")]
-            payment_config: None,
+            ldk_payment_config: None,
+            fee_config: None,
         }
     }
 
@@ -224,8 +240,13 @@ impl AgentNodeBuilder {
     }
 
     #[cfg(feature = "payments-ldk")]
-    pub fn payment_config(mut self, config: PaymentConfig) -> Self {
-        self.payment_config = Some(config);
+    pub fn ldk_payment_config(mut self, config: payment::ldk::LdkPaymentConfig) -> Self {
+        self.ldk_payment_config = Some(config);
+        self
+    }
+
+    pub fn fee_config(mut self, config: FeeConfig) -> Self {
+        self.fee_config = Some(config);
         self
     }
 
@@ -242,13 +263,17 @@ impl AgentNodeBuilder {
 
         // Start LDK payments if configured
         #[cfg(feature = "payments-ldk")]
-        let payments = if let Some(config) = self.payment_config {
-            let mut svc = PaymentService::new(config);
-            svc.start().await?;
-            Some(svc)
-        } else {
-            None
-        };
+        let payments: Option<Box<dyn PaymentProvider>> =
+            if let Some(config) = self.ldk_payment_config {
+                let mut provider = payment::ldk::LdkPaymentProvider::new(config);
+                provider.start().await?;
+                Some(Box::new(provider))
+            } else {
+                None
+            };
+
+        #[cfg(not(feature = "payments-ldk"))]
+        let payments: Option<Box<dyn PaymentProvider>> = None;
 
         // Create capability card
         if self.capabilities.is_empty() {
@@ -313,8 +338,8 @@ impl AgentNodeBuilder {
             discovery,
             messaging,
             marketplace,
-            #[cfg(feature = "payments-ldk")]
             payments,
+            fee_config: self.fee_config,
             capability_card: card,
         })
     }

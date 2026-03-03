@@ -12,7 +12,7 @@
 //!
 //! NOTE: For this to work end-to-end both agents need:
 //! - Funded on-chain wallets (run `new_onchain_address()` and send testnet BTC)
-//! - Open channels with liquidity (or use LSP for JIT channels)
+//! - Open channels with liquidity
 //!
 //! For a quick test without real channels, run with:
 //!   cargo run --example payment_flow --features payments-ldk
@@ -36,26 +36,24 @@ async fn main() -> Result<()> {
         "Translation agent with built-in Lightning wallet",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dgz2hxxeu3m54kqxuvpdmh4k804pddwttu3raem50r5xrw6c86esxd0p6w
     .secret_key("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     .capabilities(vec!["translation".into()])
     .supported_job_kinds(vec![5100])
-    .payment_config(PaymentConfig {
+    .ldk_payment_config(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-provider".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9735".to_string()),
-        ..Default::default()
     })
     .build()
     .await?;
 
     println!("Provider started: {}", provider.identity.npub());
-    if let Some(ref payments) = provider.payments {
-        println!("  Node ID: {}", payments.node_id()?);
-        println!("  On-chain balance: {} sats", payments.onchain_balance()?);
-        println!("  Fund address: {}", payments.new_onchain_address()?);
-        println!("  Channels: {:?}", payments.list_channels()?);
+    if let Some(ldk) = provider.ldk_payments() {
+        println!("  Node ID: {}", ldk.node_id()?);
+        println!("  On-chain balance: {} sats", ldk.onchain_balance()?);
+        println!("  Fund address: {}", ldk.new_onchain_address()?);
+        println!("  Channels: {:?}", ldk.list_channels()?);
     }
 
     let mut jobs = provider
@@ -69,33 +67,31 @@ async fn main() -> Result<()> {
         "Customer agent with built-in Lightning wallet",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dp5qwd78dk4msqwtygz02ld7fezhne8hzrxk0hqmggn4jtypax6szwtzka
     .secret_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     .capabilities(vec!["customer".into()])
-    .payment_config(PaymentConfig {
+    .ldk_payment_config(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-customer".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9736".to_string()),
-        ..Default::default()
     })
     .build()
     .await?;
 
     println!("\nCustomer started: {}", customer.identity.npub());
-    if let Some(ref payments) = customer.payments {
-        println!("  Node ID: {}", payments.node_id()?);
-        println!("  On-chain balance: {} sats", payments.onchain_balance()?);
-        println!("  Fund address: {}", payments.new_onchain_address()?);
-        println!("  Channels: {:?}", payments.list_channels()?);
+    if let Some(ldk) = customer.ldk_payments() {
+        println!("  Node ID: {}", ldk.node_id()?);
+        println!("  On-chain balance: {} sats", ldk.onchain_balance()?);
+        println!("  Fund address: {}", ldk.new_onchain_address()?);
+        println!("  Channels: {:?}", ldk.list_channels()?);
     }
 
     // Wait for LDK blockchain sync — poll until channel is ready
     println!("\nWaiting for blockchain sync and channel readiness...");
     for i in 1..=24 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        if let Some(ref payments) = customer.payments {
-            let channels = payments.list_channels()?;
+        if let Some(ldk) = customer.ldk_payments() {
+            let channels = ldk.list_channels()?;
             let ready = channels.iter().any(|c| c.is_channel_ready);
             if ready {
                 println!("  Channel ready after {}s!", i * 5);
@@ -107,8 +103,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(ref payments) = customer.payments {
-        println!("Customer channels: {:?}", payments.list_channels()?);
+    if let Some(ldk) = customer.ldk_payments() {
+        println!("Customer channels: {:?}", ldk.list_channels()?);
     }
 
     // Customer subscribes to feedback and results
@@ -141,10 +137,10 @@ async fn main() -> Result<()> {
 
             // 2. Generate BOLT11 invoice
             let payments = provider.payments.as_ref().expect("LDK not configured");
-            let invoice = match payments.make_invoice(1000, "elisym job payment", 3600) {
-                Ok(inv) => {
-                    println!("Provider generated invoice: {}...", &inv[..80.min(inv.len())]);
-                    inv
+            let payment_req = match payments.create_payment_request(1000, "elisym job payment", 3600) {
+                Ok(req) => {
+                    println!("Provider generated invoice: {}...", &req.request[..80.min(req.request.len())]);
+                    req
                 }
                 Err(e) => {
                     println!("Provider failed to generate invoice: {}", e);
@@ -166,18 +162,19 @@ async fn main() -> Result<()> {
                     JobStatus::PaymentRequired,
                     None,
                     Some(1000),
-                    Some(&invoice),
+                    Some(&payment_req.request),
+                    None,
                 )
                 .await
                 .expect("Failed to send feedback");
 
             println!("Provider sent payment-required feedback");
 
-            // 4. Wait for payment (poll lookup_invoice)
+            // 4. Wait for payment (poll lookup_payment)
             let mut paid = false;
             for _ in 0..30 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                match payments.lookup_invoice(&invoice) {
+                match payments.lookup_payment(&payment_req.request) {
                     Ok(status) if status.settled => {
                         println!("Provider confirmed payment received!");
                         paid = true;
@@ -218,10 +215,10 @@ async fn main() -> Result<()> {
                 println!("\nCustomer got feedback: status={}", fb.status);
 
                 if fb.status == "payment-required" {
-                    if let Some(invoice) = &fb.payment_invoice {
+                    if let Some(invoice) = &fb.payment_request {
                         println!("Customer received invoice, attempting payment...");
                         if let Some(ref payments) = customer.payments {
-                            match payments.pay_invoice(invoice) {
+                            match payments.pay(invoice) {
                                 Ok(result) => {
                                     println!("Customer payment initiated: {:?}", result);
                                 }

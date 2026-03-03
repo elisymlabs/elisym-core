@@ -58,7 +58,8 @@ pub struct CapabilityCard {
     pub description: String,
     pub capabilities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lightning_address: Option<String>,
+    #[serde(alias = "lightning_address")]
+    pub payment_address: Option<String>,
     pub protocol_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
@@ -74,14 +75,14 @@ impl CapabilityCard {
             name: name.into(),
             description: description.into(),
             capabilities,
-            lightning_address: None,
+            payment_address: None,
             protocol_version: PROTOCOL_VERSION.to_string(),
             metadata: None,
         }
     }
 
-    pub fn set_lightning_address(&mut self, address: impl Into<String>) {
-        self.lightning_address = Some(address.into());
+    pub fn set_payment_address(&mut self, address: impl Into<String>) {
+        self.payment_address = Some(address.into());
     }
 
     pub fn to_json(&self) -> Result<String> {
@@ -120,14 +121,14 @@ mod tests {
     #[test]
     fn test_capability_card_serde() {
         let mut card = CapabilityCard::new("test-agent", "A test agent", vec!["translation".into()]);
-        card.set_lightning_address("agent@wallet.com");
+        card.set_payment_address("agent@wallet.com");
 
         let json = card.to_json().unwrap();
         let parsed = CapabilityCard::from_json(&json).unwrap();
 
         assert_eq!(parsed.name, "test-agent");
         assert_eq!(parsed.capabilities, vec!["translation"]);
-        assert_eq!(parsed.lightning_address.as_deref(), Some("agent@wallet.com"));
+        assert_eq!(parsed.payment_address.as_deref(), Some("agent@wallet.com"));
         assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
     }
 

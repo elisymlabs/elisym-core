@@ -42,7 +42,8 @@ pub struct JobFeedback {
     pub request_id: EventId,
     pub status: String,
     pub extra_info: Option<String>,
-    pub payment_invoice: Option<String>,
+    pub payment_request: Option<String>,
+    pub payment_chain: Option<String>,
     pub raw_event: Event,
 }
 
@@ -348,15 +349,19 @@ impl MarketplaceService {
     /// Submit job feedback (kind:7000).
     ///
     /// When `status` is `PaymentRequired`, pass the invoice amount in
-    /// `amount_msat` and the BOLT11 string in `bolt11_invoice` to produce
-    /// a correct `["amount", msat, bolt11]` tag per NIP-90.
+    /// `amount_msat` and the payment request string in `payment_request` to produce
+    /// a correct `["amount", msat, request]` or `["amount", msat, request, chain]` tag per NIP-90.
+    ///
+    /// The optional `payment_chain` identifies the payment network (e.g., "lightning", "solana").
+    /// If omitted, "lightning" is assumed for backward compatibility.
     pub async fn submit_job_feedback(
         &self,
         request_event: &Event,
         status: JobStatus,
         extra_info: Option<&str>,
         amount_msat: Option<u64>,
-        bolt11_invoice: Option<&str>,
+        payment_request: Option<&str>,
+        payment_chain: Option<&str>,
     ) -> Result<EventId> {
         let mut tags = vec![
             Tag::event(request_event.id),
@@ -370,12 +375,16 @@ impl MarketplaceService {
             tags.push(Tag::parse(["status", &status_str])?);
         }
 
-        if let Some(invoice) = bolt11_invoice {
+        if let Some(request) = payment_request {
             let msat = amount_msat.ok_or_else(|| {
-                ElisymError::Config("amount_msat is required when bolt11_invoice is provided".into())
+                ElisymError::Config("amount_msat is required when payment_request is provided".into())
             })?;
             let msat_str = msat.to_string();
-            tags.push(Tag::parse(["amount", &msat_str, invoice])?);
+            if let Some(chain) = payment_chain {
+                tags.push(Tag::parse(["amount", &msat_str, request, chain])?);
+            } else {
+                tags.push(Tag::parse(["amount", &msat_str, request])?);
+            }
         }
 
         let builder = EventBuilder::new(kind(KIND_JOB_FEEDBACK), "").tags(tags);
@@ -505,15 +514,21 @@ fn parse_job_feedback(event: &Event) -> Option<JobFeedback> {
         }
     })?;
 
-    // Extract invoice from ["amount", msat, bolt11] tag
-    let payment_invoice = event.tags.iter().find_map(|tag| {
-        let s = tag.as_slice();
-        if s.first().map(|v| v.as_str()) == Some("amount") {
-            s.get(2).map(|v| v.to_string())
-        } else {
-            None
-        }
-    });
+    // Extract payment request and chain from ["amount", msat, request, chain?] tag
+    let (payment_request, payment_chain) = event
+        .tags
+        .iter()
+        .find_map(|tag| {
+            let s = tag.as_slice();
+            if s.first().map(|v| v.as_str()) == Some("amount") {
+                let request = s.get(2).map(|v| v.to_string());
+                let chain = s.get(3).map(|v| v.to_string());
+                Some((request, chain))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((None, None));
 
     Some(JobFeedback {
         event_id: event.id,
@@ -521,7 +536,8 @@ fn parse_job_feedback(event: &Event) -> Option<JobFeedback> {
         request_id,
         status,
         extra_info,
-        payment_invoice,
+        payment_request,
+        payment_chain,
         raw_event: event.clone(),
     })
 }
@@ -723,7 +739,7 @@ mod tests {
         assert_eq!(fb.request_id, request_event.id);
         assert_eq!(fb.status, "payment-required");
         assert_eq!(fb.extra_info, None);
-        assert_eq!(fb.payment_invoice.as_deref(), Some("lnbc10u1..."));
+        assert_eq!(fb.payment_request.as_deref(), Some("lnbc10u1..."));
         assert_eq!(fb.parsed_status(), Some(JobStatus::PaymentRequired));
     }
 
@@ -739,7 +755,7 @@ mod tests {
         let fb = parse_job_feedback(&feedback_event).expect("should parse");
         assert_eq!(fb.status, "error");
         assert_eq!(fb.extra_info.as_deref(), Some("payment-timeout"));
-        assert_eq!(fb.payment_invoice, None);
+        assert_eq!(fb.payment_request, None);
         assert_eq!(fb.parsed_status(), Some(JobStatus::Error));
     }
 

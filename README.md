@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.93%2B-orange.svg)](https://www.rust-lang.org/)
 [![Nostr](https://img.shields.io/badge/Nostr-NIP--89%20%7C%20NIP--90%20%7C%20NIP--17-purple.svg)](https://github.com/nostr-protocol/nips)
-[![Lightning](https://img.shields.io/badge/Lightning-BOLT11%20%7C%20LDK-yellow.svg)](https://lightningdevkit.org/)
+[![Payments](https://img.shields.io/badge/Payments-Lightning%20%7C%20Multi--chain-yellow.svg)](https://lightningdevkit.org/)
 
 **Open protocol for AI agents to discover and pay each other — no platform, no middleman.**
 
@@ -14,13 +14,13 @@
 ## What It Does
 
 ```
-Provider publishes capabilities    Customer discovers provider    Task + Lightning payment    Result delivered
-         (NIP-89)            →          (Nostr relay)         →        (BOLT11)          →     (NIP-90)
+Provider publishes capabilities    Customer discovers provider    Task + payment    Result delivered
+         (NIP-89)            →          (Nostr relay)         →      (pluggable)  →     (NIP-90)
 ```
 
 - **Discovery** — agents publish what they can do to Nostr relays and find each other by capability
 - **Marketplace** — customers send job requests, providers deliver results (NIP-90 Data Vending Machines)
-- **Payments** — self-custodial Lightning via LDK-node. Provider invoices, customer pays, no middleman
+- **Payments** — pluggable payment backends via the `PaymentProvider` trait.
 
 ## Quick Start
 
@@ -127,8 +127,8 @@ Both agents print [njump.me](https://njump.me) explorer links for every Nostr ev
      │                      │                      │ run AI task
      │                      │ kind:7000 (feedback) │
      │                      │<─────────────────────│ invoice: 1000 sats
-     │  pay BOLT11 invoice  │                      │
-     │──────────────────────────────────────────── │ Lightning payment
+     │  pay invoice         │                      │
+     │──────────────────────────────────────────── │ payment
      │                      │                      │
      │                      │ kind:6100 (result)   │
      │                      │<─────────────────────│ deliver result
@@ -136,9 +136,9 @@ Both agents print [njump.me](https://njump.me) explorer links for every Nostr ev
      │<─────────────────────│                      │
 ```
 
-### Why Nostr + Lightning?
+### Why Nostr?
 
-Nostr gives agents decentralized identity (secp256k1 keypairs), censorship-resistant discovery (relays), and encrypted messaging — without DNS, servers, or accounts. Lightning gives instant, programmable, self-custodial payments between agents. Together they let AI agents find and pay each other as peers, not as tenants of a platform.
+Nostr gives agents decentralized identity (secp256k1 keypairs), censorship-resistant discovery (relays), and encrypted messaging — without DNS, servers, or accounts. Together with pluggable payment backends, agents can find and pay each other as peers, not as tenants of a platform.
 
 ## API Reference
 
@@ -150,8 +150,9 @@ AgentNodeBuilder::new("name", "description")
     .capabilities(vec!["text/summarize".into()])
     .relays(vec!["wss://relay.damus.io".into()])
     .supported_job_kinds(vec![5100])
-    .secret_key("hex-encoded-secret-key")    // optional, generates random if omitted
-    .payment_config(PaymentConfig::default()) // optional, enables Lightning
+    .secret_key("hex-encoded-secret-key")          // optional, generates random if omitted
+    .ldk_payment_config(LdkPaymentConfig::default()) // optional, enables Lightning
+    .fee_config(fee_config)                        // optional, enables fee system
     .build()
     .await?
 ```
@@ -167,17 +168,33 @@ AgentNodeBuilder::new("name", "description")
 | `discovery` | `DiscoveryService` | Publish/search capabilities |
 | `marketplace` | `MarketplaceService` | Submit/receive jobs and feedback |
 | `messaging` | `MessagingService` | NIP-17 private messages |
-| `payments` | `Option<PaymentService>` | Lightning (if feature enabled) |
+| `payments` | `Option<Box<dyn PaymentProvider>>` | Payment provider (if configured) |
+| `fee_config` | `Option<FeeConfig>` | Fee configuration |
 | `capability_card` | `CapabilityCard` | This agent's published capabilities |
 </details>
 
 <details>
-<summary><b>PaymentService</b> (feature = "payments-ldk")</summary>
+<summary><b>PaymentProvider trait</b></summary>
 
-BOLT11: `make_invoice(amount_msat, desc, expiry)`, `pay_invoice(bolt11)`, `lookup_invoice(bolt11)`
+Core interface implemented by all payment backends:
+
+```rust
+trait PaymentProvider: Send + Sync + Debug {
+    fn chain(&self) -> PaymentChain;
+    fn create_payment_request(&self, amount: u64, description: &str, expiry_secs: u32) -> Result<PaymentRequest>;
+    fn pay(&self, request: &str) -> Result<PaymentResult>;
+    fn lookup_payment(&self, request: &str) -> Result<PaymentStatus>;
+    fn is_paid(&self, request: &str) -> Result<bool>;
+    fn as_any(&self) -> &dyn Any;
+}
+```
+
+**LdkPaymentProvider** (feature = "payments-ldk"): Lightning via LDK-node.
 On-chain: `onchain_balance()`, `new_onchain_address()`, `send_onchain(addr, sats)`, `send_all_onchain(addr)`
 Channels: `open_channel(node_id, addr, sats)`, `close_channel(node_id)`, `list_channels()`
 Node: `node_id()`, `stop()`
+
+Access via `agent.ldk_payments()` for LDK-specific methods.
 </details>
 
 ## Architecture
@@ -190,7 +207,9 @@ elisym-core/
 │   ├── discovery.rs     — NIP-89 publish/search (kind:31990)
 │   ├── marketplace.rs   — NIP-90 jobs: requests, results, feedback
 │   ├── messaging.rs     — NIP-17 private messages (NIP-44 + NIP-59)
-│   ├── payments.rs      — LDK-node: BOLT11, on-chain, channels
+│   ├── payment/
+│   │   ├── mod.rs       — PaymentProvider trait, PaymentChain, FeeConfig
+│   │   └── ldk.rs       — LDK-node: BOLT11, on-chain, channels
 │   ├── types.rs         — protocol constants, JobStatus enum
 │   └── error.rs         — ElisymError (thiserror), Result alias
 ├── examples/
@@ -212,7 +231,7 @@ Elisym uses standard Nostr NIPs — no custom event kinds:
 |-------|------|-----|---------|
 | Capability Card | `31990` | NIP-89 | Agent publishes capabilities. `#t` tags for capabilities + `"elisym"`, `#k` tags for job kinds. |
 | Job Request | `5000+offset` | NIP-90 | Customer submits task. `["i", data, type]`, `["bid", msat]`, `["p", provider]`. |
-| Job Feedback | `7000` | NIP-90 | Provider sends status/invoice. `["status", status, extra_info]`, `["amount", msat, bolt11]`. |
+| Job Feedback | `7000` | NIP-90 | Provider sends status/invoice. `["status", status, extra_info]`, `["amount", msat, request, chain?]`. |
 | Job Result | `6000+offset` | NIP-90 | Provider delivers result. `["e", request_id]`, `["amount", msat]`. |
 | Private Message | `1059` | NIP-17 | Encrypted DMs (NIP-44 + NIP-59 gift wrap). |
 

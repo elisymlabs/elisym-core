@@ -38,16 +38,14 @@ async fn main() -> Result<()> {
         "AI Translation Agent with Lightning wallet",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dgz2hxxeu3m54kqxuvpdmh4k804pddwttu3raem50r5xrw6c86esxd0p6w
     .secret_key("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     .capabilities(vec!["translation".into()])
     .supported_job_kinds(vec![5100])
-    .payment_config(PaymentConfig {
+    .ldk_payment_config(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-provider".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9735".to_string()),
-        ..Default::default()
     })
     .build()
     .await?;
@@ -57,42 +55,40 @@ async fn main() -> Result<()> {
         "Customer Agent with Lightning wallet",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dp5qwd78dk4msqwtygz02ld7fezhne8hzrxk0hqmggn4jtypax6szwtzka
     .secret_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     .capabilities(vec!["customer".into()])
-    .payment_config(PaymentConfig {
+    .ldk_payment_config(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-customer".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9736".to_string()),
-        ..Default::default()
     })
     .build()
     .await?;
 
-    let provider_payments = provider.payments.as_ref().expect("LDK not configured");
-    let customer_payments = customer.payments.as_ref().expect("LDK not configured");
+    let provider_ldk = provider.ldk_payments().expect("LDK not configured");
+    let customer_ldk = customer.ldk_payments().expect("LDK not configured");
 
     // Wait for initial blockchain sync
     println!("  Waiting for blockchain sync...");
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let provider_balance_before = provider_payments.onchain_balance()?;
-    let customer_balance_before = customer_payments.onchain_balance()?;
+    let provider_balance_before = provider_ldk.onchain_balance()?;
+    let customer_balance_before = customer_ldk.onchain_balance()?;
 
     println!("  Provider: {} (on-chain: {} sats)", provider.identity.npub(), provider_balance_before);
     println!("  Customer: {} (on-chain: {} sats)", customer.identity.npub(), customer_balance_before);
 
     // Open channel if none exists
     let channel_amount = 30_000u64;
-    let channels = customer_payments.list_channels()?;
+    let channels = customer_ldk.list_channels()?;
     if channels.iter().any(|c| c.is_usable) {
         println!("  Channel already usable, skipping open_channel.");
     } else {
-        let provider_node_id = provider_payments.node_id()?;
+        let provider_node_id = provider_ldk.node_id()?;
         if channels.is_empty() {
             println!("  Opening {} sat channel: customer → provider...", channel_amount);
-            let channel_id = customer_payments.open_channel(
+            let channel_id = customer_ldk.open_channel(
                 &provider_node_id,
                 "127.0.0.1:9735",
                 channel_amount,
@@ -108,7 +104,7 @@ async fn main() -> Result<()> {
         for i in 1..=40 {
             tokio::time::sleep(Duration::from_secs(30)).await;
             print!(".");
-            if customer_payments.list_channels()?.iter().any(|c| c.is_usable) {
+            if customer_ldk.list_channels()?.iter().any(|c| c.is_usable) {
                 println!(" done (~{}m)", i / 2);
                 ready = true;
                 break;
@@ -123,7 +119,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let outbound_sats = customer_payments.list_channels()?.first()
+    let outbound_sats = customer_ldk.list_channels()?.first()
         .map(|c| c.outbound_capacity_msat / 1000)
         .unwrap_or(0);
     println!("  Channel:  {} sats capacity, {} sats outbound (customer→provider)",
@@ -175,9 +171,10 @@ async fn main() -> Result<()> {
 
         // Generate BOLT11 invoice for 1500 sats
         let payments = provider.payments.as_ref().unwrap();
-        let invoice = payments
-            .make_invoice(JOB_PRICE_MSAT, "elisym translation job", 3600)
+        let payment_req = payments
+            .create_payment_request(JOB_PRICE_MSAT, "elisym translation job", 3600)
             .expect("Failed to create invoice");
+        let invoice = payment_req.request.clone();
 
         println!("  Invoice: {}...{}", &invoice[..30], &invoice[invoice.len()-10..]);
         println!("  Amount:  {} sats", JOB_PRICE_MSAT / 1000);
@@ -196,6 +193,7 @@ async fn main() -> Result<()> {
                 None,
                 Some(JOB_PRICE_MSAT),
                 Some(&invoice),
+                None,
             )
             .await
             .expect("Failed to send feedback");
@@ -207,7 +205,7 @@ async fn main() -> Result<()> {
         let mut paid = false;
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            match payments.lookup_invoice(&invoice) {
+            match payments.lookup_payment(&invoice) {
                 Ok(status) if status.settled => {
                     paid = true;
                     break;
@@ -250,13 +248,13 @@ async fn main() -> Result<()> {
         tokio::select! {
             Some(fb) = feedback_rx.recv() => {
                 if fb.status == "payment-required" {
-                    if let Some(invoice) = &fb.payment_invoice {
+                    if let Some(invoice) = &fb.payment_request {
                         println!();
                         println!("[ STEP 5 ] Customer received invoice, paying via Lightning...");
                         println!();
                         println!("  Invoice received from provider");
                         if let Some(ref payments) = customer.payments {
-                            match payments.pay_invoice(invoice) {
+                            match payments.pay(invoice) {
                                 Ok(pr) => {
                                     println!("  Payment sent! ID: {}...", &pr.payment_id[..16]);
                                     println!("  Amount: {} sats", JOB_PRICE_MSAT / 1000);
@@ -292,12 +290,12 @@ async fn main() -> Result<()> {
     println!("[ STEP 7 ] Closing Lightning channel...");
     println!();
 
-    let provider_payments = provider.payments.as_ref().unwrap();
-    let customer_payments = customer.payments.as_ref().unwrap();
-    let provider_id = provider_payments.node_id()?;
-    let _customer_id = customer_payments.node_id()?;
+    let provider_ldk = provider.ldk_payments().unwrap();
+    let customer_ldk = customer.ldk_payments().unwrap();
+    let provider_id = provider_ldk.node_id()?;
+    let _customer_id = customer_ldk.node_id()?;
 
-    customer_payments.close_channel(&provider_id)?;
+    customer_ldk.close_channel(&provider_id)?;
     println!("  Channel close initiated (cooperative)");
 
     // Wait for close
@@ -305,8 +303,8 @@ async fn main() -> Result<()> {
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_secs(3)).await;
         print!(".");
-        if customer_payments.list_channels()?.is_empty()
-            && provider_payments.list_channels()?.is_empty()
+        if customer_ldk.list_channels()?.is_empty()
+            && provider_ldk.list_channels()?.is_empty()
         {
             println!(" done");
             break;
@@ -317,8 +315,8 @@ async fn main() -> Result<()> {
     println!("  Waiting 30s for closing tx to confirm...");
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    let provider_final = provider_payments.onchain_balance()?;
-    let customer_final = customer_payments.onchain_balance()?;
+    let provider_final = provider_ldk.onchain_balance()?;
+    let customer_final = customer_ldk.onchain_balance()?;
 
     println!();
     println!("  Provider on-chain: {} sats", provider_final);
@@ -327,9 +325,6 @@ async fn main() -> Result<()> {
     // ════════════════════════════════════════════════════════════
     // SUMMARY
     // ════════════════════════════════════════════════════════════
-    // provider_balance_before is pure on-chain (no channel funds).
-    // customer_balance_before is on-chain BEFORE channel open,
-    // so total customer funds before = customer_balance_before.
     let provider_earned = provider_final as i64 - provider_balance_before as i64;
     let customer_lost = customer_balance_before as i64 - customer_final as i64;
     let payment_sats = (JOB_PRICE_MSAT / 1000) as i64;

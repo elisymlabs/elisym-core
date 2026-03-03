@@ -15,21 +15,19 @@ async fn main() -> Result<()> {
 
     println!("Starting LDK nodes...\n");
 
-    let mut provider = PaymentService::new(PaymentConfig {
+    let mut provider = LdkPaymentProvider::new(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-provider".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9735".to_string()),
-        ..Default::default()
     });
     provider.start().await?;
 
-    let mut customer = PaymentService::new(PaymentConfig {
+    let mut customer = LdkPaymentProvider::new(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-customer".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9736".to_string()),
-        ..Default::default()
     });
     customer.start().await?;
 

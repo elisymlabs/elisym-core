@@ -26,9 +26,9 @@ async fn main() -> Result<()> {
     let total_start = Instant::now();
 
     println!();
-    println!("  \u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}");
-    println!("  \u{2551}       elisym-core Demo: Customer Agent            \u{2551}");
-    println!("  \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}");
+    println!("  ╔═══════════════════════════════════════════════════╗");
+    println!("  ║       elisym-core Demo: Customer Agent            ║");
+    println!("  ╚═══════════════════════════════════════════════════╝");
     println!();
 
     // ── Step 1: Start agent + Lightning node ──
@@ -40,17 +40,13 @@ async fn main() -> Result<()> {
         "Customer agent that requests AI summarization",
     )
     // ATTN: Testnet-only hardcoded key — do NOT use on mainnet!
-    // Pubkey: npub1dp5qwd78dk4msqwtygz02ld7fezhne8hzrxk0hqmggn4jtypax6szwtzka
-    // To fund: run `cargo run --example demo_setup` — it prints the LDK on-chain address
-    // when balance is insufficient. The customer needs on-chain BTC to open a Lightning channel.
     .secret_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     .capabilities(vec!["customer".into()])
-    .payment_config(PaymentConfig {
+    .ldk_payment_config(LdkPaymentConfig {
         storage_dir: "/tmp/elisym-ldk-customer".to_string(),
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9736".to_string()),
-        ..Default::default()
     })
     .build()
     .await?;
@@ -61,7 +57,7 @@ async fn main() -> Result<()> {
     let npub = customer.identity.npub();
     println!("             Agent pubkey: {}", npub);
     println!("             Nostr profile: https://njump.me/{}", npub);
-    if let Some(ref payments) = customer.payments {
+    if let Some(payments) = customer.ldk_payments() {
         let balance = payments.onchain_balance().unwrap_or(0);
         let channels = payments.list_channels().unwrap_or_default();
         let usable = channels.iter().filter(|c| c.is_usable).count();
@@ -111,7 +107,7 @@ async fn main() -> Result<()> {
 
     // ── Pre-flight: check Lightning balance ──
     let bid_msat: u64 = 1_000_000; // 1000 sats
-    if let Some(ref payments) = customer.payments {
+    if let Some(payments) = customer.ldk_payments() {
         let channels = payments.list_channels().unwrap_or_default();
         let usable = channels.iter().filter(|c| c.is_usable).count();
         let outbound_msat: u64 = channels
@@ -192,21 +188,22 @@ async fn main() -> Result<()> {
                         println!("             Provider is processing the task...");
                     }
                     Some(JobStatus::PaymentRequired) => {
-                        if let Some(invoice) = &fb.payment_invoice {
+                        if let Some(invoice) = &fb.payment_request {
                             let fb_hex = fb.event_id.to_hex();
                             println!("  [{}] [Step 4/5] Payment requested! Paying via Lightning...", ts());
                             println!("             Feedback event: https://njump.me/{}", fb_hex);
                             println!("             Invoice: {}...{}", &invoice[..30.min(invoice.len())], &invoice[invoice.len().saturating_sub(10)..]);
                             if let Some(ref payments) = customer.payments {
                                 // Snapshot before payment
-                                let chs_before = payments.list_channels().unwrap_or_default();
+                                let ldk = customer.ldk_payments().unwrap();
+                                let chs_before = ldk.list_channels().unwrap_or_default();
                                 let outbound_before: u64 = chs_before.iter().filter(|c| c.is_usable).map(|c| c.outbound_capacity_msat / 1000).sum();
-                                match payments.pay_invoice(invoice) {
+                                match payments.pay(invoice) {
                                     Ok(pr) => {
                                         println!("             Payment sent! ID: {}...", &pr.payment_id[..16.min(pr.payment_id.len())]);
                                         println!("             Amount: 1000 sats");
                                         // Show balance change
-                                        let chs_after = payments.list_channels().unwrap_or_default();
+                                        let chs_after = ldk.list_channels().unwrap_or_default();
                                         let outbound_after: u64 = chs_after.iter().filter(|c| c.is_usable).map(|c| c.outbound_capacity_msat / 1000).sum();
                                         println!("             Lightning outbound: {} -> {} sats (-{})", outbound_before, outbound_after, outbound_before.saturating_sub(outbound_after));
                                         println!("             Done in {}", fmt_duration(step.elapsed()));
@@ -277,4 +274,3 @@ fn fmt_duration(d: Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     }
 }
-
