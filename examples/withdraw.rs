@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9735".to_string()),
+        ..Default::default()
     });
     provider.start().await?;
 
@@ -28,6 +29,7 @@ async fn main() -> Result<()> {
         network: ldk_node::bitcoin::Network::Testnet,
         esplora_url: "https://mempool.space/testnet/api".to_string(),
         listening_address: Some("0.0.0.0:9736".to_string()),
+        ..Default::default()
     });
     customer.start().await?;
 

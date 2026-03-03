@@ -13,6 +13,12 @@ pub struct PaymentConfig {
     pub esplora_url: String,
     /// Listening address for LDK-node (e.g., "0.0.0.0:9735").
     pub listening_address: Option<String>,
+    /// LSPS2 LSP node public key (hex).
+    pub lsp_node_id: Option<String>,
+    /// LSPS2 LSP address (host:port).
+    pub lsp_address: Option<String>,
+    /// Optional LSPS2 auth token.
+    pub lsp_token: Option<String>,
 }
 
 impl Default for PaymentConfig {
@@ -22,7 +28,17 @@ impl Default for PaymentConfig {
             network: ldk_node::bitcoin::Network::Testnet,
             esplora_url: crate::types::DEFAULT_ESPLORA_URL.to_string(),
             listening_address: None,
+            lsp_node_id: None,
+            lsp_address: None,
+            lsp_token: None,
         }
+    }
+}
+
+impl PaymentConfig {
+    /// Returns true if LSPS2 JIT channel configuration is present.
+    pub fn has_lsps2(&self) -> bool {
+        self.lsp_node_id.is_some() && self.lsp_address.is_some()
     }
 }
 
@@ -58,22 +74,31 @@ pub struct ChannelInfo {
 pub struct PaymentService {
     config: PaymentConfig,
     node: Option<ldk_node::Node>,
+    lsps2_enabled: bool,
 }
 
 impl std::fmt::Debug for PaymentService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PaymentService")
             .field("config", &self.config)
+            .field("lsps2_enabled", &self.lsps2_enabled)
             .finish()
     }
 }
 
 impl PaymentService {
     pub fn new(config: PaymentConfig) -> Self {
+        let lsps2_enabled = config.has_lsps2();
         Self {
             config,
             node: None,
+            lsps2_enabled,
         }
+    }
+
+    /// Returns whether LSPS2 JIT channels are configured.
+    pub fn lsps2_enabled(&self) -> bool {
+        self.lsps2_enabled
     }
 
     /// Start the LDK-node.
@@ -132,6 +157,18 @@ impl PaymentService {
                     .map_err(|e| ElisymError::Config(format!("Failed to set listening address: {}", e)))?;
             }
 
+            if let (Some(ref node_id_hex), Some(ref addr_str)) =
+                (&config.lsp_node_id, &config.lsp_address)
+            {
+                let lsp_pubkey: ldk_node::bitcoin::secp256k1::PublicKey = node_id_hex
+                    .parse()
+                    .map_err(|e| ElisymError::Config(format!("Invalid LSP node ID: {:?}", e)))?;
+                let lsp_addr: ldk_node::lightning::ln::msgs::SocketAddress = addr_str
+                    .parse()
+                    .map_err(|_| ElisymError::Config(format!("Invalid LSP address: {}", addr_str)))?;
+                builder.set_liquidity_source_lsps2(lsp_pubkey, lsp_addr, config.lsp_token.clone());
+            }
+
             let node = builder
                 .build()
                 .map_err(|e| ElisymError::Payment(format!("Failed to build LDK node: {}", e)))?;
@@ -173,10 +210,15 @@ impl PaymentService {
                 .map_err(|e| ElisymError::Payment(format!("Invalid description: {:?}", e)))?,
         );
 
-        let invoice = node
-            .bolt11_payment()
-            .receive(amount_msat, &desc, expiry_secs)
-            .map_err(|e| ElisymError::Payment(format!("Failed to create BOLT11 invoice: {}", e)))?;
+        let invoice = if self.lsps2_enabled {
+            node.bolt11_payment()
+                .receive_via_jit_channel(amount_msat, &desc, expiry_secs, None)
+                .map_err(|e| ElisymError::Payment(format!("Failed to create JIT invoice: {}", e)))?
+        } else {
+            node.bolt11_payment()
+                .receive(amount_msat, &desc, expiry_secs)
+                .map_err(|e| ElisymError::Payment(format!("Failed to create BOLT11 invoice: {}", e)))?
+        };
 
         Ok(invoice.to_string())
     }
