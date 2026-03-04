@@ -51,6 +51,9 @@ pub use payment::{PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus,
 #[cfg(feature = "payments-ldk")]
 pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
 
+#[cfg(feature = "payments-solana")]
+pub use payment::solana::{SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork, SolanaToken, USDC_MINT_MAINNET, USDC_MINT_DEVNET};
+
 use nostr_sdk::Client;
 
 /// Main orchestrator that ties all services together.
@@ -84,6 +87,13 @@ impl AgentNode {
     /// (channel management, on-chain, etc.).
     #[cfg(feature = "payments-ldk")]
     pub fn ldk_payments(&self) -> Option<&payment::ldk::LdkPaymentProvider> {
+        self.payments.as_ref()?.as_any().downcast_ref()
+    }
+
+    /// Downcast the payment provider to [`SolanaPaymentProvider`] for Solana-specific operations
+    /// (balance, airdrop, etc.).
+    #[cfg(feature = "payments-solana")]
+    pub fn solana_payments(&self) -> Option<&payment::solana::SolanaPaymentProvider> {
         self.payments.as_ref()?.as_any().downcast_ref()
     }
 
@@ -201,6 +211,8 @@ pub struct AgentNodeBuilder {
     secret_key: Option<String>,
     #[cfg(feature = "payments-ldk")]
     ldk_payment_config: Option<payment::ldk::LdkPaymentConfig>,
+    #[cfg(feature = "payments-solana")]
+    solana_payment_provider: Option<payment::solana::SolanaPaymentProvider>,
     fee_config: Option<FeeConfig>,
 }
 
@@ -215,6 +227,8 @@ impl AgentNodeBuilder {
             secret_key: None,
             #[cfg(feature = "payments-ldk")]
             ldk_payment_config: None,
+            #[cfg(feature = "payments-solana")]
+            solana_payment_provider: None,
             fee_config: None,
         }
     }
@@ -245,6 +259,13 @@ impl AgentNodeBuilder {
         self
     }
 
+    /// Set a pre-constructed Solana payment provider.
+    #[cfg(feature = "payments-solana")]
+    pub fn solana_payment_provider(mut self, provider: payment::solana::SolanaPaymentProvider) -> Self {
+        self.solana_payment_provider = Some(provider);
+        self
+    }
+
     pub fn fee_config(mut self, config: FeeConfig) -> Self {
         self.fee_config = Some(config);
         self
@@ -261,19 +282,32 @@ impl AgentNodeBuilder {
             None => AgentIdentity::generate(),
         };
 
-        // Start LDK payments if configured
-        #[cfg(feature = "payments-ldk")]
-        let payments: Option<Box<dyn PaymentProvider>> =
-            if let Some(config) = self.ldk_payment_config {
-                let mut provider = payment::ldk::LdkPaymentProvider::new(config);
-                provider.start().await?;
-                Some(Box::new(provider))
-            } else {
-                None
-            };
-
-        #[cfg(not(feature = "payments-ldk"))]
-        let payments: Option<Box<dyn PaymentProvider>> = None;
+        // Initialize payment provider (only one active at a time)
+        let payments: Option<Box<dyn PaymentProvider>> = {
+            // Try LDK first
+            #[cfg(feature = "payments-ldk")]
+            {
+                if let Some(config) = self.ldk_payment_config {
+                    let mut provider = payment::ldk::LdkPaymentProvider::new(config);
+                    provider.start().await?;
+                    Some(Box::new(provider) as Box<dyn PaymentProvider>)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "payments-ldk"))]
+            { None }
+        }
+        // Then try Solana if no LDK provider was configured
+        .or_else(|| {
+            #[cfg(feature = "payments-solana")]
+            {
+                self.solana_payment_provider
+                    .map(|p| Box::new(p) as Box<dyn PaymentProvider>)
+            }
+            #[cfg(not(feature = "payments-solana"))]
+            { None }
+        });
 
         // Create capability card
         if self.capabilities.is_empty() {

@@ -6,9 +6,13 @@
 //!
 //! Current implementations:
 //! - [`ldk::LdkPaymentProvider`] — Lightning Network via LDK-node (feature: `payments-ldk`)
+//! - [`solana::SolanaPaymentProvider`] — Solana (SOL + SPL tokens) (feature: `payments-solana`)
 
 #[cfg(feature = "payments-ldk")]
 pub mod ldk;
+
+#[cfg(feature = "payments-solana")]
+pub mod solana;
 
 use crate::error::Result;
 

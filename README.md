@@ -152,6 +152,7 @@ AgentNodeBuilder::new("name", "description")
     .supported_job_kinds(vec![5100])
     .secret_key("hex-encoded-secret-key")          // optional, generates random if omitted
     .ldk_payment_config(LdkPaymentConfig::default()) // optional, enables Lightning
+    .solana_payment_provider(solana_provider)       // optional, enables Solana
     .fee_config(fee_config)                        // optional, enables fee system
     .build()
     .await?
@@ -195,6 +196,12 @@ Channels: `open_channel(node_id, addr, sats)`, `close_channel(node_id)`, `list_c
 Node: `node_id()`, `stop()`
 
 Access via `agent.ldk_payments()` for LDK-specific methods.
+
+**SolanaPaymentProvider** (feature = "payments-solana"): Native SOL and SPL token transfers.
+Wallet: `address()`, `balance()`, `token_balance()`, `request_airdrop(lamports)`
+Constructors: `new(config, keypair)`, `from_secret_key(config, base58)`, `from_bytes(config, bytes)`
+
+Access via `agent.solana_payments()` for Solana-specific methods.
 </details>
 
 ## Architecture
@@ -209,16 +216,20 @@ elisym-core/
 │   ├── messaging.rs     — NIP-17 private messages (NIP-44 + NIP-59)
 │   ├── payment/
 │   │   ├── mod.rs       — PaymentProvider trait, PaymentChain, FeeConfig
-│   │   └── ldk.rs       — LDK-node: BOLT11, on-chain, channels
+│   │   ├── ldk.rs       — LDK-node: BOLT11, on-chain, channels
+│   │   └── solana.rs    — Solana: SOL + SPL token transfers
 │   ├── types.rs         — protocol constants, JobStatus enum
 │   └── error.rs         — ElisymError (thiserror), Result alias
 ├── examples/
-│   ├── demo_setup.rs    — one-time Lightning channel setup
-│   ├── demo_provider.rs — AI provider: Claude API + Lightning payments
-│   ├── demo_customer.rs — customer: discover → request → pay → result
 │   ├── provider.rs      — minimal provider (no payments)
 │   ├── customer.rs      — minimal customer (no payments)
-│   └── ...              — messaging, wallet_info, payment_flow, etc.
+│   ├── messaging.rs     — NIP-17 encrypted private messages
+│   ├── lightning/       — Lightning payment examples (payments-ldk)
+│   │   ├── demo_setup.rs, demo_provider.rs, demo_customer.rs
+│   │   ├── full_demo.rs, payment_flow.rs, wallet_info.rs
+│   │   └── open_channel.rs, withdraw.rs
+│   └── solana/          — Solana payment examples (payments-solana)
+│       ├── demo_provider.rs, demo_customer.rs
 └── tests/
     └── integration_tests.rs
 ```
@@ -244,22 +255,25 @@ Default relays: `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `payments-ldk` | yes | Lightning payments via LDK-node. Disable for WASM builds: `cargo build --no-default-features` |
+| `payments-solana` | no | Solana payments (SOL + SPL tokens) |
 
 ## Examples
 
-| Example | Description | Payments? |
-|---------|-------------|-----------|
-| `demo_setup` | One-time channel setup between customer and provider | Yes |
-| `demo_provider` | AI provider: Claude API + invoicing + payment + result delivery | Yes |
-| `demo_customer` | Customer: discover → request → pay → receive result | Yes |
-| `provider` | Minimal agent that listens for jobs and returns results | No |
-| `customer` | Minimal agent that discovers, sends job, receives result | No |
-| `messaging` | NIP-17 encrypted private messages between two agents | No |
-| `full_demo` | End-to-end: discover → request → invoice → pay → result | Yes |
-| `payment_flow` | BOLT11 payment-first flow | Yes |
-| `wallet_info` | LDK wallet addresses, balances, channels | Yes |
-| `open_channel` | Open a Lightning channel to a peer | Yes |
-| `withdraw` | Withdraw on-chain funds to an external address | Yes |
+| Example | Description | Feature |
+|---------|-------------|---------|
+| `provider` | Minimal agent that listens for jobs and returns results | — |
+| `customer` | Minimal agent that discovers, sends job, receives result | — |
+| `messaging` | NIP-17 encrypted private messages between two agents | — |
+| `demo_setup` | One-time Lightning channel setup between customer and provider | `payments-ldk` |
+| `demo_provider` | AI provider: Claude API + Lightning payments | `payments-ldk` |
+| `demo_customer` | Customer: discover → request → pay → receive result (Lightning) | `payments-ldk` |
+| `full_demo` | End-to-end: discover → request → invoice → pay → result | `payments-ldk` |
+| `payment_flow` | BOLT11 payment-first flow | `payments-ldk` |
+| `wallet_info` | LDK wallet addresses, balances, channels | `payments-ldk` |
+| `open_channel` | Open a Lightning channel to a peer | `payments-ldk` |
+| `withdraw` | Withdraw on-chain funds to an external address | `payments-ldk` |
+| `solana_demo_provider` | AI provider: Claude API + Solana devnet payments | `payments-solana` |
+| `solana_demo_customer` | Customer: discover → request → pay → receive result (Solana) | `payments-solana` |
 
 ## License
 

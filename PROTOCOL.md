@@ -168,7 +168,7 @@ Sent by the provider to communicate status updates, payment requests, or errors.
 | `e` | `["e", "<request-event-id>"]` | Yes | References the job request event. |
 | `p` | `["p", "<customer-pubkey-hex>"]` | Yes | References the customer who submitted the request. |
 | `status` | `["status", "<status>"]` or `["status", "<status>", "<extra-info>"]` | Yes | Current job status with optional detail. |
-| `amount` | `["amount", "<msat>", "<payment-request>", "<chain>?"]` | Conditional | Required when status is `"payment-required"`. Contains the amount in msat, the payment request string (e.g., BOLT11 invoice), and an optional chain identifier (e.g., `"lightning"`, `"solana"`). If chain is absent, `"lightning"` is assumed. |
+| `amount` | `["amount", "<amount>", "<payment-request>", "<chain>?"]` | Conditional | Required when status is `"payment-required"`. Contains the amount in the chain's base unit (msat for Lightning, lamports for Solana), the payment request string (BOLT11 invoice for Lightning, JSON for Solana), and an optional chain identifier (`"lightning"`, `"solana"`). If chain is absent, `"lightning"` is assumed. |
 
 **Status values:**
 
@@ -354,7 +354,9 @@ If payment times out, provider sends `kind:7000` with `status: "error"` and `ext
 
 ## Payment Protocol
 
-Payments use the **`PaymentProvider` trait** — a pluggable interface that supports multiple payment backends. The built-in implementation uses BOLT11 invoices over the Lightning Network via LDK-node.
+Payments use the **`PaymentProvider` trait** — a pluggable interface that supports multiple payment backends. Built-in implementations:
+- **Lightning** — BOLT11 invoices via LDK-node (feature: `payments-ldk`)
+- **Solana** — SOL and SPL token transfers with reference-based payment detection (feature: `payments-solana`)
 
 ### Payment Lifecycle
 
@@ -383,6 +385,28 @@ Payments use the **`PaymentProvider` trait** — a pluggable interface that supp
 | `network`           | enum | Yes | `Bitcoin` | Bitcoin network: `Testnet`, `Signet`, `Regtest`, or `Bitcoin` (mainnet). |
 | `esplora_url`       | string | Yes | `"https://mempool.space/api"` | Esplora server for chain sync. |
 | `listening_address` | string | No | None | P2P listening address (e.g., `"0.0.0.0:9735"`). Required for inbound channel opens. |
+
+### Solana Payment Request Format
+
+When `chain` is `"solana"`, the payment request string in the `amount` tag is a JSON object:
+
+```json
+{
+  "recipient": "<base58-pubkey>",
+  "amount": 10000000,
+  "reference": "<base58-pubkey>",
+  "mint": "<base58-pubkey>",
+  "decimals": 6
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `recipient` | string | Yes | Provider's Solana address (base58). |
+| `amount` | integer | Yes | Amount in base units (lamports for SOL, smallest unit for SPL). |
+| `reference` | string | Yes | Ephemeral reference pubkey for payment detection. Added as read-only non-signer to the transfer instruction. Provider polls `getSignaturesForAddress(reference)` to confirm payment. |
+| `mint` | string | No | SPL token mint address. Omitted for native SOL transfers. |
+| `decimals` | integer | No | Token decimal places. Omitted for native SOL transfers. |
 
 ## Subscription Filters
 
