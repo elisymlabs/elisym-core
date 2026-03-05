@@ -103,11 +103,12 @@ pub trait PaymentProvider: Send + Sync + std::fmt::Debug {
 
 /// Fee configuration for app developers.
 ///
-/// App developers set their fee as a percentage of each payment amount.
+/// Fee is expressed in **basis points** (1 bps = 0.01%, 100 bps = 1%, 300 bps = 3%).
+/// All arithmetic is integer-only to avoid floating-point rounding errors.
 #[derive(Debug, Clone)]
 pub struct FeeConfig {
-    /// App's fee as percentage of payment amount (e.g., 3.0 = 3%).
-    pub app_fee_percent: f64,
+    /// App's fee in basis points (e.g., 300 = 3%).
+    pub app_fee_bps: u64,
     /// Address to receive the app's fee.
     pub app_fee_address: String,
     /// Chain for the app's fee payment.
@@ -115,10 +116,18 @@ pub struct FeeConfig {
 }
 
 impl FeeConfig {
-    /// Calculate fee for a given payment amount.
-    /// Returns `(total_with_fee, app_fee)`.
+    /// Calculate inclusive fee for a given payment amount.
+    /// The fee is taken from the amount (not added on top).
+    /// Returns `(provider_amount, fee)` where `provider_amount + fee == amount`.
+    ///
+    /// Uses ceiling division: `fee = (amount * bps + 9999) / 10000`.
     pub fn calculate(&self, amount: u64) -> (u64, u64) {
-        let app_fee = (amount as f64 * self.app_fee_percent / 100.0) as u64;
-        (amount + app_fee, app_fee)
+        let fee = amount
+            .checked_mul(self.app_fee_bps)
+            .map(|n| n.div_ceil(10_000))
+            .unwrap_or(amount); // overflow guard: cap fee at amount
+        let fee = fee.min(amount); // never exceed amount
+        let provider_amount = amount - fee;
+        (provider_amount, fee)
     }
 }

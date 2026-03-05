@@ -103,7 +103,7 @@ impl AgentNode {
     /// This is the **recommended** way for providers to deliver paid results.
     /// Calling `submit_job_result()` directly skips payment verification.
     ///
-    /// If a [`FeeConfig`] is set, the invoice amount is increased to include fees.
+    /// If a [`FeeConfig`] is set on the payment provider, fees are split out automatically.
     pub async fn process_job_with_payment(
         &self,
         job: &marketplace::JobRequest,
@@ -118,13 +118,9 @@ impl AgentNode {
             .as_ref()
             .ok_or_else(|| ElisymError::Payment("Payments not configured".into()))?;
 
-        // Apply fee calculation if configured
-        let invoice_amount = if let Some(ref fee_config) = self.fee_config {
-            let (total, _app_fee) = fee_config.calculate(amount_msat);
-            total
-        } else {
-            amount_msat
-        };
+        // Fee is now embedded inside the payment request by the provider's
+        // create_payment_request() — no additive inflation needed.
+        let invoice_amount = amount_msat;
 
         // 1. Generate payment request (invoice)
         let payment_request = payments.create_payment_request(

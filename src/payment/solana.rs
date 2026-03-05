@@ -18,7 +18,7 @@ use solana_sdk::{
 };
 
 use crate::error::{ElisymError, Result};
-use crate::payment::{PaymentChain, PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus};
+use crate::payment::{FeeConfig, PaymentChain, PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus};
 
 /// USDC SPL token mint on Solana mainnet.
 pub const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -100,6 +100,12 @@ struct SolanaPaymentRequestData {
     /// Token decimals (omitted for native SOL).
     #[serde(skip_serializing_if = "Option::is_none")]
     decimals: Option<u8>,
+    /// Fee recipient address (omitted when no fee configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fee_address: Option<String>,
+    /// Fee amount in base units (omitted when no fee configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fee_amount: Option<u64>,
 }
 
 /// Tracks a pending payment request.
@@ -119,6 +125,7 @@ pub struct SolanaPaymentProvider {
     keypair: Keypair,
     rpc_client: RpcClient,
     pending: Mutex<HashMap<String, PendingPayment>>,
+    fee_config: Option<FeeConfig>,
 }
 
 impl std::fmt::Debug for SolanaPaymentProvider {
@@ -140,6 +147,7 @@ impl SolanaPaymentProvider {
             keypair,
             rpc_client,
             pending: Mutex::new(HashMap::new()),
+            fee_config: None,
         }
     }
 
@@ -194,6 +202,13 @@ impl SolanaPaymentProvider {
         }
     }
 
+    /// Set a fee configuration for protocol fees.
+    /// When set, `create_payment_request()` embeds fee info in the request JSON,
+    /// and `pay()` splits the payment into provider + fee transfers.
+    pub fn set_fee_config(&mut self, config: FeeConfig) {
+        self.fee_config = Some(config);
+    }
+
     /// Request an airdrop of SOL (devnet/testnet only).
     pub fn request_airdrop(&self, lamports: u64) -> Result<String> {
         let sig = self
@@ -203,20 +218,72 @@ impl SolanaPaymentProvider {
         Ok(sig.to_string())
     }
 
+    /// Check if a fee transfer is viable: the destination account must either
+    /// already exist or the transfer amount must meet rent-exempt minimum.
+    /// Returns true if the fee should be included, false if it should be skipped.
+    fn should_include_fee(&self, fee_address: &Pubkey, fee_amount: u64) -> bool {
+        // If account already has balance, any transfer amount is fine
+        match self.rpc_client.get_balance(fee_address) {
+            Ok(balance) if balance > 0 => return true,
+            Ok(_) => {} // zero balance — need rent check
+            Err(_) => {} // can't reach RPC — be conservative, check rent
+        }
+
+        // Account doesn't exist: fee must meet rent-exempt minimum for a 0-data account
+        let rent_exempt_min = self
+            .rpc_client
+            .get_minimum_balance_for_rent_exemption(0)
+            .unwrap_or(890_880); // fallback to known constant
+
+        if fee_amount < rent_exempt_min {
+            tracing::warn!(
+                fee_amount,
+                rent_exempt_min,
+                fee_address = %fee_address,
+                "fee below rent-exempt minimum and account doesn't exist — skipping fee transfer"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Build a native SOL transfer instruction with reference key.
+    /// If `fee_params` is provided, adds a second transfer for the fee amount
+    /// and sends `(amount - fee)` to the recipient.
     fn build_sol_transfer(
         &self,
         recipient: &Pubkey,
         amount: u64,
         reference: &Pubkey,
+        fee_params: Option<&(Pubkey, u64)>,
     ) -> Result<Transaction> {
-        #[allow(deprecated)] // solana_sdk re-exports from solana_system_interface
+        let mut instructions: Vec<Instruction> = Vec::new();
+
+        // Check if fee transfer is viable (rent-exempt check)
+        let effective_fee = fee_params.filter(|(addr, amt)| self.should_include_fee(addr, *amt));
+
+        let provider_amount = if let Some((_, fee_amount)) = effective_fee {
+            amount.saturating_sub(*fee_amount)
+        } else {
+            amount
+        };
+
+        // Provider transfer with reference key
+        #[allow(deprecated)]
         let mut transfer_ix =
-            solana_sdk::system_instruction::transfer(&self.keypair.pubkey(), recipient, amount);
-        // Add reference pubkey as read-only non-signer for payment detection
+            solana_sdk::system_instruction::transfer(&self.keypair.pubkey(), recipient, provider_amount);
         transfer_ix
             .accounts
             .push(AccountMeta::new_readonly(*reference, false));
+        instructions.push(transfer_ix);
+
+        // Fee transfer (if viable)
+        if let Some((fee_address, fee_amount)) = effective_fee {
+            #[allow(deprecated)]
+            let fee_ix =
+                solana_sdk::system_instruction::transfer(&self.keypair.pubkey(), fee_address, *fee_amount);
+            instructions.push(fee_ix);
+        }
 
         let recent_blockhash = self
             .rpc_client
@@ -224,18 +291,21 @@ impl SolanaPaymentProvider {
             .map_err(|e| ElisymError::Payment(format!("Failed to get blockhash: {}", e)))?;
 
         let message =
-            Message::new_with_blockhash(&[transfer_ix], Some(&self.keypair.pubkey()), &recent_blockhash);
+            Message::new_with_blockhash(&instructions, Some(&self.keypair.pubkey()), &recent_blockhash);
         let tx = Transaction::new(&[&self.keypair], message, recent_blockhash);
         Ok(tx)
     }
 
     /// Build an SPL token transfer instruction with reference key.
+    /// If `fee_params` is provided, adds a second SPL transfer for the fee amount
+    /// and sends `(amount - fee)` to the recipient.
     fn build_spl_transfer(
         &self,
         recipient: &Pubkey,
         amount: u64,
         mint: &Pubkey,
         reference: &Pubkey,
+        fee_params: Option<&(Pubkey, u64)>,
     ) -> Result<Transaction> {
         let sender_ata = spl_associated_token_account::get_associated_token_address(
             &self.keypair.pubkey(),
@@ -249,21 +319,27 @@ impl SolanaPaymentProvider {
         // Create recipient ATA if it doesn't exist (idempotent)
         instructions.push(
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &self.keypair.pubkey(), // payer
-                recipient,              // wallet
-                mint,                   // mint
-                &spl_token::id(),       // token program
+                &self.keypair.pubkey(),
+                recipient,
+                mint,
+                &spl_token::id(),
             ),
         );
 
-        // SPL token transfer
+        let provider_amount = if let Some((_, fee_amount)) = fee_params {
+            amount.saturating_sub(*fee_amount)
+        } else {
+            amount
+        };
+
+        // SPL token transfer to provider
         let mut transfer_ix = spl_token::instruction::transfer(
             &spl_token::id(),
             &sender_ata,
             &recipient_ata,
             &self.keypair.pubkey(),
             &[],
-            amount,
+            provider_amount,
         )
         .map_err(|e| ElisymError::Payment(format!("Failed to create SPL transfer: {}", e)))?;
 
@@ -271,8 +347,34 @@ impl SolanaPaymentProvider {
         transfer_ix
             .accounts
             .push(AccountMeta::new_readonly(*reference, false));
-
         instructions.push(transfer_ix);
+
+        // Fee transfer (if configured)
+        if let Some((fee_address, fee_amount)) = fee_params {
+            let fee_ata =
+                spl_associated_token_account::get_associated_token_address(fee_address, mint);
+
+            // Create fee ATA idempotently
+            instructions.push(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &self.keypair.pubkey(),
+                    fee_address,
+                    mint,
+                    &spl_token::id(),
+                ),
+            );
+
+            let fee_ix = spl_token::instruction::transfer(
+                &spl_token::id(),
+                &sender_ata,
+                &fee_ata,
+                &self.keypair.pubkey(),
+                &[],
+                *fee_amount,
+            )
+            .map_err(|e| ElisymError::Payment(format!("Failed to create SPL fee transfer: {}", e)))?;
+            instructions.push(fee_ix);
+        }
 
         let recent_blockhash = self
             .rpc_client
@@ -322,12 +424,25 @@ impl PaymentProvider for SolanaPaymentProvider {
             SolanaToken::Spl { decimals, .. } => format!("token({}dp)", decimals),
         };
 
+        let (fee_address, fee_amount) = if let Some(ref fc) = self.fee_config {
+            let (_provider_amount, fee) = fc.calculate(amount);
+            if fee > 0 {
+                (Some(fc.app_fee_address.clone()), Some(fee))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         let data = SolanaPaymentRequestData {
             recipient: self.keypair.pubkey().to_string(),
             amount,
             reference: reference.to_string(),
             mint,
             decimals,
+            fee_address,
+            fee_amount,
         };
 
         let request = serde_json::to_string(&data)
@@ -367,13 +482,24 @@ impl PaymentProvider for SolanaPaymentProvider {
             .parse()
             .map_err(|e| ElisymError::Payment(format!("Invalid reference pubkey: {:?}", e)))?;
 
+        // Parse optional fee parameters
+        let fee_params = match (data.fee_address, data.fee_amount) {
+            (Some(addr), Some(amt)) if amt > 0 => {
+                let fee_pubkey: Pubkey = addr.parse().map_err(|e| {
+                    ElisymError::Payment(format!("Invalid fee address: {:?}", e))
+                })?;
+                Some((fee_pubkey, amt))
+            }
+            _ => None,
+        };
+
         let tx = match data.mint {
-            None => self.build_sol_transfer(&recipient, data.amount, &reference)?,
+            None => self.build_sol_transfer(&recipient, data.amount, &reference, fee_params.as_ref())?,
             Some(mint_str) => {
                 let mint: Pubkey = mint_str
                     .parse()
                     .map_err(|e| ElisymError::Payment(format!("Invalid mint address: {:?}", e)))?;
-                self.build_spl_transfer(&recipient, data.amount, &mint, &reference)?
+                self.build_spl_transfer(&recipient, data.amount, &mint, &reference, fee_params.as_ref())?
             }
         };
 
@@ -495,16 +621,22 @@ mod tests {
             reference: "22222222222222222222222222222222".to_string(),
             mint: None,
             decimals: None,
+            fee_address: None,
+            fee_amount: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(!json.contains("mint"));
         assert!(!json.contains("decimals"));
+        assert!(!json.contains("fee_address"));
+        assert!(!json.contains("fee_amount"));
         let parsed: SolanaPaymentRequestData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.recipient, data.recipient);
         assert_eq!(parsed.amount, data.amount);
         assert_eq!(parsed.reference, data.reference);
         assert!(parsed.mint.is_none());
         assert!(parsed.decimals.is_none());
+        assert!(parsed.fee_address.is_none());
+        assert!(parsed.fee_amount.is_none());
     }
 
     #[test]
@@ -515,6 +647,8 @@ mod tests {
             reference: "22222222222222222222222222222222".to_string(),
             mint: Some(USDC_MINT_DEVNET.to_string()),
             decimals: Some(6),
+            fee_address: None,
+            fee_amount: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("mint"));
@@ -522,6 +656,59 @@ mod tests {
         let parsed: SolanaPaymentRequestData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.mint, data.mint);
         assert_eq!(parsed.decimals, Some(6));
+    }
+
+    #[test]
+    fn test_fee_calculation_inclusive() {
+        let fc = FeeConfig {
+            app_fee_bps: 300,
+            app_fee_address: "11111111111111111111111111111111".to_string(),
+            app_fee_chain: PaymentChain::Solana,
+        };
+        let (provider, fee) = fc.calculate(100_000);
+        assert_eq!(fee, 3_000);
+        assert_eq!(provider, 97_000);
+        assert_eq!(provider + fee, 100_000);
+
+        // Edge: small amount where ceil matters
+        let (provider, fee) = fc.calculate(100);
+        assert_eq!(fee, 3); // ceil(3.0) = 3
+        assert_eq!(provider, 97);
+
+        // Edge: zero
+        let (provider, fee) = fc.calculate(0);
+        assert_eq!(fee, 0);
+        assert_eq!(provider, 0);
+    }
+
+    #[test]
+    fn test_request_serialization_with_fee() {
+        let data = SolanaPaymentRequestData {
+            recipient: "11111111111111111111111111111111".to_string(),
+            amount: 100_000,
+            reference: "22222222222222222222222222222222".to_string(),
+            mint: None,
+            decimals: None,
+            fee_address: Some("33333333333333333333333333333333".to_string()),
+            fee_amount: Some(3_000),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("fee_address"));
+        assert!(json.contains("fee_amount"));
+        let parsed: SolanaPaymentRequestData = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fee_address.as_deref(), Some("33333333333333333333333333333333"));
+        assert_eq!(parsed.fee_amount, Some(3_000));
+    }
+
+    #[test]
+    fn test_backwards_compat_no_fee() {
+        // Old format without fee fields should still parse
+        let json = r#"{"recipient":"11111111111111111111111111111111","amount":100000,"reference":"22222222222222222222222222222222"}"#;
+        let parsed: SolanaPaymentRequestData = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.amount, 100_000);
+        assert!(parsed.fee_address.is_none());
+        assert!(parsed.fee_amount.is_none());
+        assert!(parsed.mint.is_none());
     }
 
     #[test]
