@@ -4,7 +4,6 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // Agent A — sender
     let agent_a = AgentNodeBuilder::new("agent-alpha", "Sender agent")

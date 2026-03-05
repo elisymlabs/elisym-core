@@ -8,12 +8,12 @@ license = "MIT"
 repository = "https://github.com/elisymprotocol/elisym-core"
 homepage = "https://github.com/elisymprotocol/elisym-core"
 readme = "README.md"
-keywords = ["nostr", "lightning", "ai-agents", "ldk", "nip-90"]
+keywords = ["nostr", "lightning", "ai-agents", "solana", "nip-90"]
 categories = ["network-programming", "cryptography::cryptocurrencies"]
-exclude = ["assets/", "CLAUDE.md"]
+exclude = ["assets/", "CLAUDE.md", "Cargo.lock"]
 
 [features]
-default = ["payments-ldk"]
+default = []
 payments-ldk = ["ldk-node", "rustls"]
 payments-solana = ["solana-sdk", "solana-client", "spl-token", "spl-associated-token-account", "bs58"]
 

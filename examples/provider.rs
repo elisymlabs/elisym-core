@@ -3,7 +3,6 @@ use elisym_core::*;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // Use a fixed identity so customer can find us
     let identity = AgentIdentity::from_secret_key(
