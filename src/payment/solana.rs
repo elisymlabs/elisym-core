@@ -21,7 +21,7 @@ use solana_transaction_status_client_types::{
 };
 
 use crate::error::{ElisymError, Result};
-use crate::payment::{FeeConfig, PaymentChain, PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus};
+use crate::payment::{PaymentChain, PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus};
 
 /// USDC SPL token mint on Solana mainnet.
 pub const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -128,7 +128,6 @@ pub struct SolanaPaymentProvider {
     keypair: Keypair,
     rpc_client: RpcClient,
     pending: Mutex<HashMap<String, PendingPayment>>,
-    fee_config: Option<FeeConfig>,
 }
 
 impl std::fmt::Debug for SolanaPaymentProvider {
@@ -150,7 +149,6 @@ impl SolanaPaymentProvider {
             keypair,
             rpc_client,
             pending: Mutex::new(HashMap::new()),
-            fee_config: None,
         }
     }
 
@@ -205,11 +203,33 @@ impl SolanaPaymentProvider {
         }
     }
 
-    /// Set a fee configuration for protocol fees.
-    /// When set, `create_payment_request()` embeds fee info in the request JSON,
-    /// and `pay()` splits the payment into provider + fee transfers.
-    pub fn set_fee_config(&mut self, config: FeeConfig) {
-        self.fee_config = Some(config);
+    /// Create a payment request with an embedded fee split.
+    ///
+    /// The fee is inclusive (subtracted from `amount`, not added on top).
+    /// When a customer calls `pay()` on this request, the transaction will
+    /// send `amount - fee_amount` to the provider and `fee_amount` to `fee_address`.
+    ///
+    /// Fee calculation is the caller's responsibility — this method only embeds
+    /// the pre-computed values into the payment request.
+    pub fn create_payment_request_with_fee(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry_secs: u32,
+        fee_address: &str,
+        fee_amount: u64,
+    ) -> Result<PaymentRequest> {
+        if fee_amount >= amount {
+            return Err(ElisymError::Payment(
+                "fee_amount must be less than amount".into(),
+            ));
+        }
+        self.create_payment_request_inner(
+            amount,
+            description,
+            expiry_secs,
+            if fee_amount > 0 { Some((fee_address.to_string(), fee_amount)) } else { None },
+        )
     }
 
     /// Request an airdrop of SOL (devnet/testnet only).
@@ -362,16 +382,14 @@ impl SolanaPaymentProvider {
     }
 }
 
-impl PaymentProvider for SolanaPaymentProvider {
-    fn chain(&self) -> PaymentChain {
-        PaymentChain::Solana
-    }
-
-    fn create_payment_request(
+impl SolanaPaymentProvider {
+    /// Shared logic for creating a payment request, with optional fee.
+    fn create_payment_request_inner(
         &self,
         amount: u64,
         _description: &str,
         _expiry_secs: u32,
+        fee: Option<(String, u64)>,
     ) -> Result<PaymentRequest> {
         if amount == 0 {
             return Err(ElisymError::Payment(
@@ -395,15 +413,9 @@ impl PaymentProvider for SolanaPaymentProvider {
             SolanaToken::Spl { decimals, .. } => format!("token({}dp)", decimals),
         };
 
-        let (fee_address, fee_amount) = if let Some(ref fc) = self.fee_config {
-            let (_provider_amount, fee) = fc.calculate(amount);
-            if fee > 0 {
-                (Some(fc.app_fee_address.clone()), Some(fee))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
+        let (fee_address, fee_amount) = match fee {
+            Some((addr, amt)) => (Some(addr), Some(amt)),
+            None => (None, None),
         };
 
         let data = SolanaPaymentRequestData {
@@ -437,6 +449,21 @@ impl PaymentProvider for SolanaPaymentProvider {
             currency_unit,
             request,
         })
+    }
+}
+
+impl PaymentProvider for SolanaPaymentProvider {
+    fn chain(&self) -> PaymentChain {
+        PaymentChain::Solana
+    }
+
+    fn create_payment_request(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<PaymentRequest> {
+        self.create_payment_request_inner(amount, description, expiry_secs, None)
     }
 
     fn pay(&self, request: &str) -> Result<PaymentResult> {
@@ -678,29 +705,6 @@ mod tests {
         let parsed: SolanaPaymentRequestData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.mint, data.mint);
         assert_eq!(parsed.decimals, Some(6));
-    }
-
-    #[test]
-    fn test_fee_calculation_inclusive() {
-        let fc = FeeConfig {
-            app_fee_bps: 300,
-            app_fee_address: "11111111111111111111111111111111".to_string(),
-            app_fee_chain: PaymentChain::Solana,
-        };
-        let (provider, fee) = fc.calculate(100_000);
-        assert_eq!(fee, 3_000);
-        assert_eq!(provider, 97_000);
-        assert_eq!(provider + fee, 100_000);
-
-        // Edge: small amount where ceil matters
-        let (provider, fee) = fc.calculate(100);
-        assert_eq!(fee, 3); // ceil(3.0) = 3
-        assert_eq!(provider, 97);
-
-        // Edge: zero
-        let (provider, fee) = fc.calculate(0);
-        assert_eq!(fee, 0);
-        assert_eq!(provider, 0);
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub use identity::{AgentIdentity, CapabilityCard};
 pub use discovery::{DiscoveryService, DiscoveredAgent, AgentFilter};
 pub use messaging::MessagingService;
 pub use marketplace::MarketplaceService;
-pub use payment::{PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus, PaymentChain, FeeConfig};
+pub use payment::{PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus, PaymentChain};
 
 #[cfg(feature = "payments-ldk")]
 pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
@@ -65,8 +65,6 @@ pub struct AgentNode {
     pub marketplace: MarketplaceService,
     /// Pluggable payment provider (Lightning, Solana, etc.).
     pub payments: Option<Box<dyn PaymentProvider>>,
-    /// Optional fee configuration for app developer + platform fees.
-    pub fee_config: Option<FeeConfig>,
     pub capability_card: CapabilityCard,
 }
 
@@ -103,7 +101,6 @@ impl AgentNode {
     /// This is the **recommended** way for providers to deliver paid results.
     /// Calling `submit_job_result()` directly skips payment verification.
     ///
-    /// If a [`FeeConfig`] is set on the payment provider, fees are split out automatically.
     pub async fn process_job_with_payment(
         &self,
         job: &marketplace::JobRequest,
@@ -118,27 +115,23 @@ impl AgentNode {
             .as_ref()
             .ok_or_else(|| ElisymError::Payment("Payments not configured".into()))?;
 
-        // Fee is now embedded inside the payment request by the provider's
-        // create_payment_request() — no additive inflation needed.
-        let invoice_amount = amount;
-
-        // 1. Generate payment request (invoice)
+        // 1. Generate payment request
         let payment_request = payments.create_payment_request(
-            invoice_amount,
+            amount,
             invoice_description,
             invoice_expiry_secs,
         )?;
 
         let chain_str = payment_request.chain.to_string();
-        tracing::info!(amount = invoice_amount, chain = %chain_str, "Generated payment request for job");
+        tracing::info!(amount, chain = %chain_str, "Generated payment request for job");
 
-        // 2. Send payment-required feedback with invoice
+        // 2. Send payment-required feedback
         self.marketplace
             .submit_job_feedback(
                 &job.raw_event,
                 JobStatus::PaymentRequired,
                 None,
-                Some(invoice_amount),
+                Some(amount),
                 Some(&payment_request.request),
                 Some(&chain_str),
             )
@@ -167,7 +160,7 @@ impl AgentNode {
 
             match payments.lookup_payment(&payment_request.request) {
                 Ok(status) if status.settled => {
-                    tracing::info!(amount = invoice_amount, "Payment confirmed");
+                    tracing::info!(amount, "Payment confirmed");
                     break;
                 }
                 _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
@@ -179,7 +172,7 @@ impl AgentNode {
         for attempt in 0..3u32 {
             match self
                 .marketplace
-                .submit_job_result(&job.raw_event, result_content, Some(invoice_amount))
+                .submit_job_result(&job.raw_event, result_content, Some(amount))
                 .await
             {
                 Ok(event_id) => return Ok(event_id),
@@ -209,7 +202,6 @@ pub struct AgentNodeBuilder {
     ldk_payment_config: Option<payment::ldk::LdkPaymentConfig>,
     #[cfg(feature = "payments-solana")]
     solana_payment_provider: Option<payment::solana::SolanaPaymentProvider>,
-    fee_config: Option<FeeConfig>,
 }
 
 impl AgentNodeBuilder {
@@ -225,7 +217,6 @@ impl AgentNodeBuilder {
             ldk_payment_config: None,
             #[cfg(feature = "payments-solana")]
             solana_payment_provider: None,
-            fee_config: None,
         }
     }
 
@@ -259,11 +250,6 @@ impl AgentNodeBuilder {
     #[cfg(feature = "payments-solana")]
     pub fn solana_payment_provider(mut self, provider: payment::solana::SolanaPaymentProvider) -> Self {
         self.solana_payment_provider = Some(provider);
-        self
-    }
-
-    pub fn fee_config(mut self, config: FeeConfig) -> Self {
-        self.fee_config = Some(config);
         self
     }
 
@@ -378,7 +364,6 @@ impl AgentNodeBuilder {
             messaging,
             marketplace,
             payments,
-            fee_config: self.fee_config,
             capability_card: card,
         })
     }
