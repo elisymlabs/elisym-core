@@ -18,7 +18,7 @@ pub struct JobRequest {
     pub input_data: String,
     pub input_type: String,
     pub output_mime: Option<String>,
-    pub bid_msat: Option<u64>,
+    pub bid: Option<u64>,
     pub tags: Vec<String>,
     pub raw_event: Event,
 }
@@ -30,7 +30,7 @@ pub struct JobResult {
     pub provider: PublicKey,
     pub request_id: EventId,
     pub content: String,
-    pub amount_msat: Option<u64>,
+    pub amount: Option<u64>,
     pub raw_event: Event,
 }
 
@@ -83,7 +83,7 @@ impl MarketplaceService {
         input_data: &str,
         input_type: &str,
         output_mime: Option<&str>,
-        bid_msat: Option<u64>,
+        bid: Option<u64>,
         provider: Option<&PublicKey>,
         extra_tags: Vec<String>,
     ) -> Result<EventId> {
@@ -99,9 +99,9 @@ impl MarketplaceService {
             tags.push(Tag::parse(["output", mime])?);
         }
 
-        if let Some(msat) = bid_msat {
-            let msat_str = msat.to_string();
-            tags.push(Tag::parse(["bid", &msat_str])?);
+        if let Some(val) = bid {
+            let val_str = val.to_string();
+            tags.push(Tag::parse(["bid", &val_str])?);
         }
 
         if let Some(pk) = provider {
@@ -315,7 +315,7 @@ impl MarketplaceService {
         &self,
         request_event: &Event,
         content: &str,
-        amount_msat: Option<u64>,
+        amount: Option<u64>,
     ) -> Result<EventId> {
         let kind_offset = request_event
             .kind
@@ -331,9 +331,9 @@ impl MarketplaceService {
             Tag::public_key(request_event.pubkey),
         ];
 
-        if let Some(msat) = amount_msat {
-            let msat_str = msat.to_string();
-            tags.push(Tag::parse(["amount", &msat_str])?);
+        if let Some(val) = amount {
+            let val_str = val.to_string();
+            tags.push(Tag::parse(["amount", &val_str])?);
         }
 
         let request_json = serde_json::to_string(&request_event)?;
@@ -348,9 +348,9 @@ impl MarketplaceService {
 
     /// Submit job feedback (kind:7000).
     ///
-    /// When `status` is `PaymentRequired`, pass the invoice amount in
-    /// `amount_msat` and the payment request string in `payment_request` to produce
-    /// a correct `["amount", msat, request]` or `["amount", msat, request, chain]` tag per NIP-90.
+    /// When `status` is `PaymentRequired`, pass the payment amount in
+    /// `amount` and the payment request string in `payment_request` to produce
+    /// a correct `["amount", amount, request]` or `["amount", amount, request, chain]` tag per NIP-90.
     ///
     /// The optional `payment_chain` identifies the payment network (e.g., "lightning", "solana").
     /// If omitted, "lightning" is assumed for backward compatibility.
@@ -359,7 +359,7 @@ impl MarketplaceService {
         request_event: &Event,
         status: JobStatus,
         extra_info: Option<&str>,
-        amount_msat: Option<u64>,
+        amount: Option<u64>,
         payment_request: Option<&str>,
         payment_chain: Option<&str>,
     ) -> Result<EventId> {
@@ -376,14 +376,14 @@ impl MarketplaceService {
         }
 
         if let Some(request) = payment_request {
-            let msat = amount_msat.ok_or_else(|| {
-                ElisymError::Config("amount_msat is required when payment_request is provided".into())
+            let amt = amount.ok_or_else(|| {
+                ElisymError::Config("amount is required when payment_request is provided".into())
             })?;
-            let msat_str = msat.to_string();
+            let amt_str = amt.to_string();
             if let Some(chain) = payment_chain {
-                tags.push(Tag::parse(["amount", &msat_str, request, chain])?);
+                tags.push(Tag::parse(["amount", &amt_str, request, chain])?);
             } else {
-                tags.push(Tag::parse(["amount", &msat_str, request])?);
+                tags.push(Tag::parse(["amount", &amt_str, request])?);
             }
         }
 
@@ -457,7 +457,7 @@ fn parse_job_request(event: &Event) -> Option<JobRequest> {
         }
     })?;
 
-    let bid_msat = get_tag_value(event, "bid").and_then(|v| v.parse().ok());
+    let bid = get_tag_value(event, "bid").and_then(|v| v.parse().ok());
     let output_mime = get_tag_value(event, "output");
     let tags = get_tag_values(event, "t");
 
@@ -468,7 +468,7 @@ fn parse_job_request(event: &Event) -> Option<JobRequest> {
         input_data,
         input_type,
         output_mime,
-        bid_msat,
+        bid,
         tags,
         raw_event: event.clone(),
     })
@@ -480,7 +480,7 @@ fn parse_job_result(event: &Event) -> Option<JobResult> {
     // 2. Fall back to the first "e" tag
     let request_id = resolve_request_id(event)?;
 
-    let amount_msat = event.tags.iter().find_map(|tag| {
+    let amount = event.tags.iter().find_map(|tag| {
         let s = tag.as_slice();
         if s.first().map(|v| v.as_str()) == Some("amount") {
             s.get(1).and_then(|v| v.parse().ok())
@@ -494,7 +494,7 @@ fn parse_job_result(event: &Event) -> Option<JobResult> {
         provider: event.pubkey,
         request_id,
         content: event.content.clone(),
-        amount_msat,
+        amount,
         raw_event: event.clone(),
     })
 }
@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(req.input_data, "Summarize this text");
         assert_eq!(req.input_type, "text");
         assert_eq!(req.output_mime.as_deref(), Some("text/plain"));
-        assert_eq!(req.bid_msat, Some(1_000_000));
+        assert_eq!(req.bid, Some(1_000_000));
         assert_eq!(req.kind_offset, 100);
         assert_eq!(req.tags, vec!["summarization"]);
         assert_eq!(req.customer, event.pubkey);
@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(req.input_data, "data");
         assert_eq!(req.input_type, "url");
         assert_eq!(req.output_mime, None);
-        assert_eq!(req.bid_msat, None);
+        assert_eq!(req.bid, None);
         assert!(req.tags.is_empty());
     }
 
@@ -663,7 +663,7 @@ mod tests {
             Tag::parse(["bid", "not-a-number"]).unwrap(),
         ]);
         let req = parse_job_request(&event).expect("should parse");
-        assert_eq!(req.bid_msat, None);
+        assert_eq!(req.bid, None);
     }
 
     // ── parse_job_result ──
@@ -680,7 +680,7 @@ mod tests {
         let result = parse_job_result(&result_event).expect("should parse");
         assert_eq!(result.request_id, request_event.id);
         assert_eq!(result.content, "Summary: this is a summary");
-        assert_eq!(result.amount_msat, Some(1_000_000));
+        assert_eq!(result.amount, Some(1_000_000));
         assert_eq!(result.provider, result_event.pubkey);
     }
 
@@ -698,7 +698,7 @@ mod tests {
         let result = parse_job_result(&result_event).expect("should parse");
         // Should prefer "request" tag for request_id
         assert_eq!(result.request_id, request_event.id);
-        assert_eq!(result.amount_msat, Some(500_000));
+        assert_eq!(result.amount, Some(500_000));
     }
 
     #[test]
@@ -719,7 +719,7 @@ mod tests {
             Tag::event(request_event.id),
         ]);
         let result = parse_job_result(&result_event).expect("should parse");
-        assert_eq!(result.amount_msat, None);
+        assert_eq!(result.amount, None);
         assert_eq!(result.content, "free result");
     }
 

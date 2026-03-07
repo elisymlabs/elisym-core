@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     #[derive(serde::Serialize)]
     struct TaskProposal {
         task: String,
-        bid_msat: u64,
+        bid: u64,
     }
 
     println!("\n--- Agent A sending structured JSON message to Agent B ---");
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
             &agent_b.identity.public_key(),
             &TaskProposal {
                 task: "Translate 'hello world' to Spanish".into(),
-                bid_msat: 5000,
+                bid: 5000,
             },
         )
         .await?;

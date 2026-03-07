@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     println!();
 
     // ── Pre-flight: check Lightning balance ──
-    let bid_msat: u64 = 1_000_000; // 1000 sats
+    let bid: u64 = 1_000_000; // 1000 sats
     if let Some(payments) = customer.ldk_payments() {
         let channels = payments.list_channels().unwrap_or_default();
         let usable = channels.iter().filter(|c| c.is_usable).count();
@@ -124,9 +124,9 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
-        if outbound_msat < bid_msat {
+        if outbound_msat < bid {
             println!("  ERROR: Insufficient Lightning outbound capacity!");
-            println!("         Required:  {} sats (job bid)", bid_msat / 1000);
+            println!("         Required:  {} sats (job bid)", bid / 1000);
             println!("         Available: {} sats outbound", outbound_msat / 1000);
             println!("         Open a larger channel or fund the existing one.");
             println!("         Run `cargo run --example demo_setup` for channel setup.");
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
     let step = Instant::now();
     println!("  [{}] [Step 3/5] Submitting summarization task...", ts());
     println!("             Text: \"{}\"", SAMPLE_TEXT);
-    println!("             Bid: {} sats", bid_msat / 1000);
+    println!("             Bid: {} sats", bid / 1000);
 
     // Subscribe to feedback and results before submitting
     let mut feedback_rx = customer.marketplace.subscribe_to_feedback().await?;
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
             SAMPLE_TEXT,
             "text",
             Some("text/plain"),
-            Some(bid_msat),
+            Some(bid),
             Some(&provider.pubkey),
             vec!["summarization".into()],
         )

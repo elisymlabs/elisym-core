@@ -108,7 +108,7 @@ impl AgentNode {
         &self,
         job: &marketplace::JobRequest,
         result_content: &str,
-        amount_msat: u64,
+        amount: u64,
         invoice_description: &str,
         invoice_expiry_secs: u32,
         payment_timeout: std::time::Duration,
@@ -120,7 +120,7 @@ impl AgentNode {
 
         // Fee is now embedded inside the payment request by the provider's
         // create_payment_request() — no additive inflation needed.
-        let invoice_amount = amount_msat;
+        let invoice_amount = amount;
 
         // 1. Generate payment request (invoice)
         let payment_request = payments.create_payment_request(
@@ -130,7 +130,7 @@ impl AgentNode {
         )?;
 
         let chain_str = payment_request.chain.to_string();
-        tracing::info!(amount_msat = invoice_amount, chain = %chain_str, "Generated payment request for job");
+        tracing::info!(amount = invoice_amount, chain = %chain_str, "Generated payment request for job");
 
         // 2. Send payment-required feedback with invoice
         self.marketplace
@@ -167,7 +167,7 @@ impl AgentNode {
 
             match payments.lookup_payment(&payment_request.request) {
                 Ok(status) if status.settled => {
-                    tracing::info!(amount_msat = invoice_amount, "Payment confirmed");
+                    tracing::info!(amount = invoice_amount, "Payment confirmed");
                     break;
                 }
                 _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
