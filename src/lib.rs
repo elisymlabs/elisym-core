@@ -104,6 +104,19 @@ impl AgentNode {
     /// This method creates a payment request without fees. For fee-aware
     /// payments, use the provider-specific method (e.g.,
     /// `SolanaPaymentProvider::create_payment_request_with_fee()`) directly.
+    ///
+    /// # Known limitation: paid-but-undelivered failure
+    ///
+    /// If the payment is confirmed but all result delivery attempts fail
+    /// (e.g., relay outage), the customer has paid but will **not** receive
+    /// the result. Currently, an error feedback event is sent to notify the
+    /// customer, but there is no automatic retry or refund mechanism.
+    ///
+    /// Callers should handle the returned `Err` and implement their own
+    /// recovery strategy (e.g., persist the result for later re-delivery,
+    /// initiate a refund, or alert an operator).
+    ///
+    /// A built-in recovery mechanism is planned for a future release.
     pub async fn process_job_with_payment(
         &self,
         job: &marketplace::JobRequest,
@@ -191,6 +204,19 @@ impl AgentNode {
                 }
             }
         }
+
+        // Notify customer that payment was received but delivery failed
+        let _ = self
+            .marketplace
+            .submit_job_feedback(
+                &job.raw_event,
+                JobStatus::Error,
+                Some("payment-received-delivery-failed"),
+                None,
+                None,
+                None,
+            )
+            .await;
 
         Err(last_err.unwrap_or_else(|| {
             ElisymError::Payment("Failed to deliver result after payment".into())

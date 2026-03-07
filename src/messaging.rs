@@ -6,6 +6,23 @@ use crate::dedup::BoundedDedup;
 use crate::error::Result;
 use crate::identity::AgentIdentity;
 
+/// Receive the next notification, handling lagged broadcast receivers by
+/// logging the skip and continuing. Returns `None` when the channel is closed.
+async fn recv_notification(
+    notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+) -> Option<RelayPoolNotification> {
+    loop {
+        match notifications.recv().await {
+            Ok(n) => return Some(n),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "Subscription receiver lagged, some events may have been missed");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 /// A received private message.
 #[derive(Debug, Clone)]
 pub struct PrivateMessage {
@@ -68,7 +85,7 @@ impl MessagingService {
         tokio::spawn(async move {
             let mut notifications = client.notifications();
             let mut seen = BoundedDedup::new(10_000);
-            while let Ok(notification) = notifications.recv().await {
+            while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if !seen.insert(event.id) {
                         continue;
@@ -93,7 +110,7 @@ impl MessagingService {
                     }
                 }
             }
-            tracing::debug!("subscription task ended: messages");
+            tracing::warn!("subscription task ended: messages (notification channel closed)");
         });
 
         Ok(rx)

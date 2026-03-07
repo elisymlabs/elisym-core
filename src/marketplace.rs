@@ -6,6 +6,23 @@ use crate::error::{ElisymError, Result};
 use crate::identity::AgentIdentity;
 use crate::types::{kind, job_request_kind, job_result_kind, JobStatus, KIND_JOB_FEEDBACK, KIND_JOB_REQUEST_BASE, KIND_JOB_RESULT_BASE};
 
+/// Receive the next notification, handling lagged broadcast receivers by
+/// logging the skip and continuing. Returns `None` when the channel is closed.
+async fn recv_notification(
+    notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+) -> Option<RelayPoolNotification> {
+    loop {
+        match notifications.recv().await {
+            Ok(n) => return Some(n),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "Subscription receiver lagged, some events may have been missed");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 /// Max number of event IDs to keep for deduplication in subscription handlers.
 const DEDUP_CAPACITY: usize = 10_000;
 
@@ -157,7 +174,7 @@ impl MarketplaceService {
         tokio::spawn(async move {
             let mut notifications = client.notifications();
             let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
-            while let Ok(notification) = notifications.recv().await {
+            while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if !seen.insert(event.id) {
                         continue; // duplicate from another relay
@@ -180,7 +197,7 @@ impl MarketplaceService {
                     }
                 }
             }
-            tracing::debug!("subscription task ended: results");
+            tracing::warn!("subscription task ended: results (notification channel closed)");
         });
 
         Ok(rx)
@@ -205,7 +222,7 @@ impl MarketplaceService {
         tokio::spawn(async move {
             let mut notifications = client.notifications();
             let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
-            while let Ok(notification) = notifications.recv().await {
+            while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if !seen.insert(event.id) {
                         continue;
@@ -219,7 +236,7 @@ impl MarketplaceService {
                     }
                 }
             }
-            tracing::debug!("subscription task ended: feedback");
+            tracing::warn!("subscription task ended: feedback (notification channel closed)");
         });
 
         Ok(rx)
@@ -270,7 +287,7 @@ impl MarketplaceService {
         tokio::spawn(async move {
             let mut notifications = client.notifications();
             let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
-            while let Ok(notification) = notifications.recv().await {
+            while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if !seen.insert(event.id) {
                         continue; // duplicate from broadcast + directed filters or multiple relays
@@ -307,7 +324,7 @@ impl MarketplaceService {
                     }
                 }
             }
-            tracing::debug!("subscription task ended: job_requests");
+            tracing::warn!("subscription task ended: job_requests (notification channel closed)");
         });
 
         Ok(rx)

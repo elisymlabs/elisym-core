@@ -348,9 +348,25 @@ impl PaymentProvider for SolanaPaymentProvider {
             .parse()
             .map_err(|e| ElisymError::Payment(format!("Invalid reference pubkey: {:?}", e)))?;
 
-        // Parse optional fee parameters
+        // Parse optional fee parameters.
+        // SECURITY: fee_address and fee_amount come from the untrusted payment
+        // request created by the provider. Callers MUST validate these values
+        // against their expected fee configuration before calling pay().
         let fee_params = match (data.fee_address, data.fee_amount) {
             (Some(addr), Some(amt)) if amt > 0 => {
+                tracing::warn!(
+                    fee_address = %addr,
+                    fee_amount = amt,
+                    total_amount = data.amount,
+                    fee_pct = format!("{:.1}%", (amt as f64 / data.amount as f64) * 100.0),
+                    "Payment request contains fee parameters — ensure these were validated before calling pay()"
+                );
+                if amt >= data.amount {
+                    return Err(ElisymError::Payment(format!(
+                        "fee_amount ({}) must be less than total amount ({})",
+                        amt, data.amount
+                    )));
+                }
                 let fee_pubkey: Pubkey = addr.parse().map_err(|e| {
                     ElisymError::Payment(format!("Invalid fee address: {:?}", e))
                 })?;
