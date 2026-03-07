@@ -219,7 +219,7 @@ impl AgentNodeBuilder {
             description: description.into(),
             capabilities: Vec::new(),
             relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
-            supported_job_kinds: vec![5100],
+            supported_job_kinds: vec![KIND_JOB_REQUEST_BASE + DEFAULT_KIND_OFFSET],
             secret_key: None,
             #[cfg(feature = "payments-ldk")]
             ldk_payment_config: None,
