@@ -1,6 +1,6 @@
 [package]
 name = "elisym-core"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.93"
 description = "Rust SDK for AI agent interaction via Nostr with pluggable payment backends"
@@ -15,7 +15,7 @@ exclude = ["assets/", "CLAUDE.md", "Cargo.lock"]
 [features]
 default = []
 payments-ldk = ["ldk-node", "rustls"]
-payments-solana = ["solana-sdk", "solana-client", "solana-transaction-status-client-types", "spl-token", "spl-associated-token-account", "bs58"]
+payments-solana = ["solana-sdk", "solana-client", "solana-transaction-status-client-types", "bs58"]
 
 [dependencies]
 nostr-sdk = { version = "0.37", features = ["nip59"] }
@@ -29,8 +29,6 @@ tracing = "0.1"
 solana-sdk = { version = "2.2", optional = true }
 solana-client = { version = "2.2", optional = true }
 solana-transaction-status-client-types = { version = "2.2", optional = true }
-spl-token = { version = "7.0", optional = true, features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "6.0", optional = true, features = ["no-entrypoint"] }
 bs58 = { version = "0.5", optional = true }
 
 [dev-dependencies]

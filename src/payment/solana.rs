@@ -1,4 +1,4 @@
-//! Solana payment provider — SOL and SPL token transfers.
+//! Solana payment provider — native SOL transfers.
 //!
 //! Uses a reference-based payment detection approach: each payment request includes
 //! a unique ephemeral reference pubkey added as a read-only non-signer to the transfer
@@ -23,12 +23,6 @@ use solana_transaction_status_client_types::{
 use crate::error::{ElisymError, Result};
 use crate::payment::{PaymentChain, PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus};
 
-/// USDC SPL token mint on Solana mainnet.
-pub const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-/// USDC SPL token mint on Solana devnet.
-pub const USDC_MINT_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
-
 /// Solana network selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolanaNetwork {
@@ -50,15 +44,6 @@ impl SolanaNetwork {
     }
 }
 
-/// Token type for Solana payments.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SolanaToken {
-    /// Native SOL (amounts in lamports).
-    Sol,
-    /// SPL token with its mint address and decimals.
-    Spl { mint: Pubkey, decimals: u8 },
-}
-
 /// Configuration for the Solana payment provider.
 #[derive(Debug, Clone)]
 pub struct SolanaPaymentConfig {
@@ -66,8 +51,6 @@ pub struct SolanaPaymentConfig {
     pub network: SolanaNetwork,
     /// Custom RPC URL (overrides the network default if set).
     pub rpc_url: Option<String>,
-    /// Token type (native SOL or SPL token).
-    pub token: SolanaToken,
 }
 
 impl Default for SolanaPaymentConfig {
@@ -75,7 +58,6 @@ impl Default for SolanaPaymentConfig {
         Self {
             network: SolanaNetwork::Devnet,
             rpc_url: None,
-            token: SolanaToken::Sol,
         }
     }
 }
@@ -93,20 +75,14 @@ impl SolanaPaymentConfig {
 struct SolanaPaymentRequestData {
     /// Recipient's base58 public key.
     recipient: String,
-    /// Amount in base units (lamports for SOL, smallest unit for SPL).
+    /// Amount in lamports.
     amount: u64,
     /// Ephemeral reference pubkey for payment detection.
     reference: String,
-    /// SPL token mint (omitted for native SOL).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mint: Option<String>,
-    /// Token decimals (omitted for native SOL).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    decimals: Option<u8>,
     /// Fee recipient address (omitted when no fee configured).
     #[serde(skip_serializing_if = "Option::is_none")]
     fee_address: Option<String>,
-    /// Fee amount in base units (omitted when no fee configured).
+    /// Fee amount in lamports (omitted when no fee configured).
     #[serde(skip_serializing_if = "Option::is_none")]
     fee_amount: Option<u64>,
 }
@@ -118,7 +94,10 @@ struct PendingPayment {
     settled: bool,
 }
 
-/// Solana payment provider supporting native SOL and SPL token transfers.
+/// Maximum number of entries allowed in the pending map before cleanup.
+const PENDING_MAP_CAP: usize = 10_000;
+
+/// Solana payment provider supporting native SOL transfers.
 ///
 /// Uses reference-based payment detection: each payment request includes a unique
 /// ephemeral reference pubkey. Payment confirmation is done by checking
@@ -179,30 +158,6 @@ impl SolanaPaymentProvider {
             .map_err(|e| ElisymError::Payment(format!("Failed to get balance: {}", e)))
     }
 
-    /// Get SPL token balance (in token base units) for the configured token.
-    /// Returns 0 if no token account exists.
-    pub fn token_balance(&self) -> Result<u64> {
-        let mint = match &self.config.token {
-            SolanaToken::Sol => {
-                return self.balance();
-            }
-            SolanaToken::Spl { mint, .. } => *mint,
-        };
-
-        let ata = spl_associated_token_account::get_associated_token_address(
-            &self.keypair.pubkey(),
-            &mint,
-        );
-
-        match self.rpc_client.get_token_account_balance(&ata) {
-            Ok(balance) => balance
-                .amount
-                .parse::<u64>()
-                .map_err(|e| ElisymError::Payment(format!("Failed to parse token balance: {}", e))),
-            Err(_) => Ok(0), // No token account → zero balance
-        }
-    }
-
     /// Create a payment request with an embedded fee split.
     ///
     /// The fee is inclusive (subtracted from `amount`, not added on top).
@@ -211,6 +166,11 @@ impl SolanaPaymentProvider {
     ///
     /// Fee calculation is the caller's responsibility — this method only embeds
     /// the pre-computed values into the payment request.
+    ///
+    /// # Example
+    ///
+    /// With `amount = 100_000` lamports and `fee_amount = 3_000` lamports (3%),
+    /// the provider receives 97_000 lamports and the fee address receives 3_000.
     pub fn create_payment_request_with_fee(
         &self,
         amount: u64,
@@ -244,7 +204,7 @@ impl SolanaPaymentProvider {
     /// Build a native SOL transfer instruction with reference key.
     /// If `fee_params` is provided, adds a second transfer for the fee amount
     /// and sends `(amount - fee)` to the recipient.
-    fn build_sol_transfer(
+    fn build_transfer(
         &self,
         recipient: &Pubkey,
         amount: u64,
@@ -287,102 +247,6 @@ impl SolanaPaymentProvider {
         Ok(tx)
     }
 
-    /// Build an SPL token transfer instruction with reference key.
-    /// If `fee_params` is provided, adds a second SPL transfer for the fee amount
-    /// and sends `(amount - fee)` to the recipient.
-    fn build_spl_transfer(
-        &self,
-        recipient: &Pubkey,
-        amount: u64,
-        mint: &Pubkey,
-        reference: &Pubkey,
-        fee_params: Option<&(Pubkey, u64)>,
-    ) -> Result<Transaction> {
-        let sender_ata = spl_associated_token_account::get_associated_token_address(
-            &self.keypair.pubkey(),
-            mint,
-        );
-        let recipient_ata =
-            spl_associated_token_account::get_associated_token_address(recipient, mint);
-
-        let mut instructions: Vec<Instruction> = Vec::new();
-
-        // Create recipient ATA if it doesn't exist (idempotent)
-        instructions.push(
-            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &self.keypair.pubkey(),
-                recipient,
-                mint,
-                &spl_token::id(),
-            ),
-        );
-
-        let provider_amount = if let Some((_, fee_amount)) = fee_params {
-            amount.saturating_sub(*fee_amount)
-        } else {
-            amount
-        };
-
-        // SPL token transfer to provider
-        let mut transfer_ix = spl_token::instruction::transfer(
-            &spl_token::id(),
-            &sender_ata,
-            &recipient_ata,
-            &self.keypair.pubkey(),
-            &[],
-            provider_amount,
-        )
-        .map_err(|e| ElisymError::Payment(format!("Failed to create SPL transfer: {}", e)))?;
-
-        // Add reference pubkey as read-only non-signer for payment detection
-        transfer_ix
-            .accounts
-            .push(AccountMeta::new_readonly(*reference, false));
-        instructions.push(transfer_ix);
-
-        // Fee transfer (if configured)
-        if let Some((fee_address, fee_amount)) = fee_params {
-            let fee_ata =
-                spl_associated_token_account::get_associated_token_address(fee_address, mint);
-
-            // Create fee ATA idempotently
-            instructions.push(
-                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                    &self.keypair.pubkey(),
-                    fee_address,
-                    mint,
-                    &spl_token::id(),
-                ),
-            );
-
-            let fee_ix = spl_token::instruction::transfer(
-                &spl_token::id(),
-                &sender_ata,
-                &fee_ata,
-                &self.keypair.pubkey(),
-                &[],
-                *fee_amount,
-            )
-            .map_err(|e| ElisymError::Payment(format!("Failed to create SPL fee transfer: {}", e)))?;
-            instructions.push(fee_ix);
-        }
-
-        let recent_blockhash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .map_err(|e| ElisymError::Payment(format!("Failed to get blockhash: {}", e)))?;
-
-        let message = Message::new_with_blockhash(
-            &instructions,
-            Some(&self.keypair.pubkey()),
-            &recent_blockhash,
-        );
-        let tx = Transaction::new(&[&self.keypair], message, recent_blockhash);
-        Ok(tx)
-    }
-}
-
-impl SolanaPaymentProvider {
     /// Shared logic for creating a payment request, with optional fee.
     fn create_payment_request_inner(
         &self,
@@ -401,18 +265,6 @@ impl SolanaPaymentProvider {
         let reference_keypair = Keypair::new();
         let reference = reference_keypair.pubkey();
 
-        let (mint, decimals) = match &self.config.token {
-            SolanaToken::Sol => (None, None),
-            SolanaToken::Spl { mint, decimals } => {
-                (Some(mint.to_string()), Some(*decimals))
-            }
-        };
-
-        let currency_unit = match &self.config.token {
-            SolanaToken::Sol => "lamport".to_string(),
-            SolanaToken::Spl { decimals, .. } => format!("token({}dp)", decimals),
-        };
-
         let (fee_address, fee_amount) = match fee {
             Some((addr, amt)) => (Some(addr), Some(amt)),
             None => (None, None),
@@ -422,8 +274,6 @@ impl SolanaPaymentProvider {
             recipient: self.keypair.pubkey().to_string(),
             amount,
             reference: reference.to_string(),
-            mint,
-            decimals,
             fee_address,
             fee_amount,
         };
@@ -433,7 +283,16 @@ impl SolanaPaymentProvider {
 
         // Track this pending payment
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| ElisymError::Payment("internal lock poisoned".into()))?;
+
+            // Cap the pending map size by clearing settled entries
+            if pending.len() >= PENDING_MAP_CAP {
+                pending.retain(|_, v| !v.settled);
+            }
+
             pending.insert(
                 request.clone(),
                 PendingPayment {
@@ -446,7 +305,7 @@ impl SolanaPaymentProvider {
         Ok(PaymentRequest {
             chain: PaymentChain::Solana,
             amount,
-            currency_unit,
+            currency_unit: "lamport".to_string(),
             request,
         })
     }
@@ -466,6 +325,15 @@ impl PaymentProvider for SolanaPaymentProvider {
         self.create_payment_request_inner(amount, description, expiry_secs, None)
     }
 
+    /// Pay a Solana payment request by sending a SOL transfer on-chain.
+    ///
+    /// # Security
+    ///
+    /// The caller **MUST** validate `fee_address` and `fee_amount` from the
+    /// deserialized payment request before calling this method. The payment request
+    /// is untrusted data — a malicious provider could set an arbitrary fee address
+    /// or inflate the fee amount. Always verify that the fee parameters match the
+    /// expected application fee configuration.
     fn pay(&self, request: &str) -> Result<PaymentResult> {
         let data: SolanaPaymentRequestData = serde_json::from_str(request)
             .map_err(|e| ElisymError::Payment(format!("Invalid payment request: {}", e)))?;
@@ -491,15 +359,7 @@ impl PaymentProvider for SolanaPaymentProvider {
             _ => None,
         };
 
-        let tx = match data.mint {
-            None => self.build_sol_transfer(&recipient, data.amount, &reference, fee_params.as_ref())?,
-            Some(mint_str) => {
-                let mint: Pubkey = mint_str
-                    .parse()
-                    .map_err(|e| ElisymError::Payment(format!("Invalid mint address: {:?}", e)))?;
-                self.build_spl_transfer(&recipient, data.amount, &mint, &reference, fee_params.as_ref())?
-            }
-        };
+        let tx = self.build_transfer(&recipient, data.amount, &reference, fee_params.as_ref())?;
 
         let sig = self
             .rpc_client
@@ -515,7 +375,10 @@ impl PaymentProvider for SolanaPaymentProvider {
     fn lookup_payment(&self, request: &str) -> Result<PaymentStatus> {
         // Check local cache first
         {
-            let pending = self.pending.lock().unwrap();
+            let pending = self
+                .pending
+                .lock()
+                .map_err(|_| ElisymError::Payment("internal lock poisoned".into()))?;
             if let Some(p) = pending.get(request) {
                 if p.settled {
                     return Ok(PaymentStatus {
@@ -586,20 +449,19 @@ impl PaymentProvider for SolanaPaymentProvider {
                 _ => continue,
             };
 
-            // Find recipient's index and verify SOL balance change.
-            // TODO: For SPL tokens, verify via meta.pre_token_balances / post_token_balances
-            // instead of pre_balances / post_balances (which only track native SOL).
+            // Find recipient's index and verify SOL balance change
             if let Some(idx) = account_keys.iter().position(|k| k == &data.recipient) {
                 let pre = meta.pre_balances[idx];
                 let post = meta.post_balances[idx];
                 let received = post.saturating_sub(pre);
 
                 if received >= expected_net {
-                    // Payment verified — mark as settled
-                    let mut pending = self.pending.lock().unwrap();
-                    if let Some(p) = pending.get_mut(request) {
-                        p.settled = true;
-                    }
+                    // Payment verified — remove from pending (no longer needed)
+                    let mut pending = self
+                        .pending
+                        .lock()
+                        .map_err(|_| ElisymError::Payment("internal lock poisoned".into()))?;
+                    pending.remove(request);
                     return Ok(PaymentStatus {
                         settled: true,
                         amount: Some(received),
@@ -629,7 +491,6 @@ mod tests {
         let config = SolanaPaymentConfig::default();
         assert_eq!(config.network, SolanaNetwork::Devnet);
         assert!(config.rpc_url.is_none());
-        assert_eq!(config.token, SolanaToken::Sol);
     }
 
     #[test]
@@ -657,7 +518,6 @@ mod tests {
         let config = SolanaPaymentConfig {
             network: SolanaNetwork::Devnet,
             rpc_url: Some("http://my-rpc:8899".to_string()),
-            token: SolanaToken::Sol,
         };
         assert_eq!(config.effective_rpc_url(), "http://my-rpc:8899");
     }
@@ -668,43 +528,18 @@ mod tests {
             recipient: "11111111111111111111111111111111".to_string(),
             amount: 10_000_000,
             reference: "22222222222222222222222222222222".to_string(),
-            mint: None,
-            decimals: None,
             fee_address: None,
             fee_amount: None,
         };
         let json = serde_json::to_string(&data).unwrap();
-        assert!(!json.contains("mint"));
-        assert!(!json.contains("decimals"));
         assert!(!json.contains("fee_address"));
         assert!(!json.contains("fee_amount"));
         let parsed: SolanaPaymentRequestData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.recipient, data.recipient);
         assert_eq!(parsed.amount, data.amount);
         assert_eq!(parsed.reference, data.reference);
-        assert!(parsed.mint.is_none());
-        assert!(parsed.decimals.is_none());
         assert!(parsed.fee_address.is_none());
         assert!(parsed.fee_amount.is_none());
-    }
-
-    #[test]
-    fn test_request_serialization_roundtrip_spl() {
-        let data = SolanaPaymentRequestData {
-            recipient: "11111111111111111111111111111111".to_string(),
-            amount: 1_000_000,
-            reference: "22222222222222222222222222222222".to_string(),
-            mint: Some(USDC_MINT_DEVNET.to_string()),
-            decimals: Some(6),
-            fee_address: None,
-            fee_amount: None,
-        };
-        let json = serde_json::to_string(&data).unwrap();
-        assert!(json.contains("mint"));
-        assert!(json.contains("decimals"));
-        let parsed: SolanaPaymentRequestData = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.mint, data.mint);
-        assert_eq!(parsed.decimals, Some(6));
     }
 
     #[test]
@@ -713,8 +548,6 @@ mod tests {
             recipient: "11111111111111111111111111111111".to_string(),
             amount: 100_000,
             reference: "22222222222222222222222222222222".to_string(),
-            mint: None,
-            decimals: None,
             fee_address: Some("33333333333333333333333333333333".to_string()),
             fee_amount: Some(3_000),
         };
@@ -734,7 +567,6 @@ mod tests {
         assert_eq!(parsed.amount, 100_000);
         assert!(parsed.fee_address.is_none());
         assert!(parsed.fee_amount.is_none());
-        assert!(parsed.mint.is_none());
     }
 
     #[test]
@@ -775,25 +607,35 @@ mod tests {
         // Verify the request string is valid JSON with expected fields
         let data: SolanaPaymentRequestData = serde_json::from_str(&req.request).unwrap();
         assert_eq!(data.amount, 10_000_000);
-        assert!(data.mint.is_none());
     }
 
     #[test]
-    fn test_create_payment_request_spl() {
-        let mint: Pubkey = USDC_MINT_DEVNET.parse().unwrap();
-        let config = SolanaPaymentConfig {
-            token: SolanaToken::Spl { mint, decimals: 6 },
-            ..Default::default()
-        };
+    fn test_pending_map_cap_cleanup() {
         let keypair = Keypair::new();
-        let provider = SolanaPaymentProvider::new(config, keypair);
-        let req = provider
-            .create_payment_request(1_000_000, "USDC payment", 3600)
-            .unwrap();
-        assert_eq!(req.currency_unit, "token(6dp)");
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
 
-        let data: SolanaPaymentRequestData = serde_json::from_str(&req.request).unwrap();
-        assert_eq!(data.mint.as_deref(), Some(USDC_MINT_DEVNET));
-        assert_eq!(data.decimals, Some(6));
+        // Insert settled entries up to the cap
+        {
+            let mut pending = provider.pending.lock().unwrap();
+            for i in 0..PENDING_MAP_CAP {
+                pending.insert(
+                    format!("request_{}", i),
+                    PendingPayment {
+                        amount: 1000,
+                        settled: true,
+                    },
+                );
+            }
+            assert_eq!(pending.len(), PENDING_MAP_CAP);
+        }
+
+        // Creating a new request should trigger cleanup of settled entries
+        let req = provider.create_payment_request(1000, "test", 3600).unwrap();
+        {
+            let pending = provider.pending.lock().unwrap();
+            // Only the new request should remain (all old ones were settled and cleaned)
+            assert_eq!(pending.len(), 1);
+            assert!(pending.contains_key(&req.request));
+        }
     }
 }

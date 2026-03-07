@@ -180,6 +180,7 @@ impl MarketplaceService {
                     }
                 }
             }
+            tracing::debug!("subscription task ended: results");
         });
 
         Ok(rx)
@@ -218,6 +219,7 @@ impl MarketplaceService {
                     }
                 }
             }
+            tracing::debug!("subscription task ended: feedback");
         });
 
         Ok(rx)
@@ -305,6 +307,7 @@ impl MarketplaceService {
                     }
                 }
             }
+            tracing::debug!("subscription task ended: job_requests");
         });
 
         Ok(rx)

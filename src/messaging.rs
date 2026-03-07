@@ -93,6 +93,7 @@ impl MessagingService {
                     }
                 }
             }
+            tracing::debug!("subscription task ended: messages");
         });
 
         Ok(rx)

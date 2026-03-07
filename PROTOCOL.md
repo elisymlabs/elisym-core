@@ -37,7 +37,7 @@ elisym uses five Nostr event types across three NIPs:
 | Job Result | `6000 + offset` | NIP-90 | Provider delivers the result |
 | Private Message | `1059` (gift wrap) | NIP-17 | Encrypted direct messages |
 
-Payments use pluggable payment backends via the `PaymentProvider` trait. The built-in backend uses BOLT11 invoices over Lightning Network (via LDK-node). The payment request is embedded in a Job Feedback event.
+Payments use pluggable payment backends via the `PaymentProvider` trait. Built-in backends: BOLT11 invoices over Lightning Network (via LDK-node) and Solana (native SOL only). The payment request is embedded in a Job Feedback event.
 
 ## Identity
 
@@ -124,7 +124,7 @@ Submitted by a customer to request work from a provider.
 |-----|--------|----------|-------------|
 | `i` | `["i", "<data>", "<type>"]` | Yes | Input data. `type` is `"text"`, `"url"`, etc. If `type` is omitted, defaults to `"text"`. |
 | `output` | `["output", "<mime-type>"]` | No | Desired output format (e.g., `"text/plain"`). |
-| `bid` | `["bid", "<amount-msat>"]` | No | Price the customer is willing to pay, in millisatoshis. String-encoded integer. |
+| `bid` | `["bid", "<amount>"]` | No | Amount in the payment chain's base unit (msat for Lightning, lamports for Solana). String-encoded integer. |
 | `p` | `["p", "<provider-pubkey-hex>"]` | No | Target a specific provider. If omitted, the request is a broadcast to all providers. |
 | `t` | `["t", "<capability>"]` | No | Capability tags for filtering. |
 
@@ -149,7 +149,7 @@ Submitted by a customer to request work from a provider.
 ```
 
 **Notes:**
-- The `bid` value is in **millisatoshis** (1000 msat = 1 sat).
+- The `bid` value is in **the chain's base unit** (msat for Lightning, lamports for Solana).
 - A non-numeric `bid` value is silently ignored by parsers (treated as no bid).
 - Kind offset MUST be in range `[0, 999]` (kind `5000`–`5999`). Values producing kinds >= `6000` are invalid.
 
@@ -174,7 +174,7 @@ Sent by the provider to communicate status updates, payment requests, or errors.
 
 | Status | Description |
 |--------|-------------|
-| `payment-required` | Provider is requesting payment. The `amount` tag MUST contain the BOLT11 invoice. |
+| `payment-required` | Provider is requesting payment. The `amount` tag MUST contain the payment request string (BOLT11 invoice for Lightning, JSON for Solana). |
 | `processing` | Provider is working on the task. |
 | `error` | An error occurred. `extra_info` MAY contain a reason (e.g., `"payment-timeout"`). |
 | `success` | Job completed successfully. |
@@ -231,7 +231,7 @@ Delivered by the provider after completing the task (and optionally after paymen
 |-----|--------|----------|-------------|
 | `e` | `["e", "<request-event-id>"]` | Yes | References the original job request. |
 | `p` | `["p", "<customer-pubkey-hex>"]` | Yes | References the customer. |
-| `amount` | `["amount", "<msat>"]` | No | Amount paid, in millisatoshis. |
+| `amount` | `["amount", "<amount>"]` | No | Amount paid, in the chain's base unit. |
 | `request` | `["request", "<stringified-request-event>"]` | No | Full JSON of the original request event. Provides robustness when multiple `e` tags are present. |
 
 **Full example:**
@@ -323,7 +323,7 @@ Customer                          Relay                           Provider
 Customer                          Relay                           Provider
    │                                │                                │
    │  kind:5100 (job request)       │                                │
-   │  bid: 1000000 msat             │                                │
+   │  bid: 1000000                   │                                │
    │───────────────────────────────>│───────────────────────────────>│
    │                                │                                │
    │                                │  kind:7000 (processing)        │
@@ -334,20 +334,20 @@ Customer                          Relay                           Provider
    │                                │  amount: [1000000, lnbc...]    │
    │<───────────────────────────────│<───────────────────────────────│
    │                                │                                │
-   │  ─ ─ ─ ─ Lightning BOLT11 payment ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─>│
+   │  ─ ─ ─ ─ payment (Lightning/Solana) ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─>│
    │                                │                                │
    │                                │                                │ (confirm payment
-   │                                │                                │  via lookup_invoice)
+   │                                │                                │  via lookup_payment)
    │                                │                                │
    │                                │  kind:6100 (job result)        │
    │<───────────────────────────────│<───────────────────────────────│
 ```
 
 **Payment timeline:**
-1. Provider receives job request, processes the task, generates BOLT11 invoice
-2. Provider sends `kind:7000` feedback with `status: "payment-required"` and `amount` tag containing the invoice
-3. Customer parses the feedback, extracts the invoice from the `amount` tag (3rd element), and pays via Lightning
-4. Provider polls `lookup_invoice()` until `settled == true` (1-second intervals, configurable timeout)
+1. Provider receives job request, processes the task, generates payment request
+2. Provider sends `kind:7000` feedback with `status: "payment-required"` and `amount` tag containing the payment request
+3. Customer parses the feedback, extracts the payment request from the `amount` tag (3rd element), and pays via the appropriate backend
+4. Provider polls `lookup_payment()` until `settled == true` (1-second intervals, configurable timeout)
 5. Provider delivers the result as `kind:6100`
 
 If payment times out, provider sends `kind:7000` with `status: "error"` and `extra_info: "payment-timeout"`.
@@ -356,7 +356,7 @@ If payment times out, provider sends `kind:7000` with `status: "error"` and `ext
 
 Payments use the **`PaymentProvider` trait** — a pluggable interface that supports multiple payment backends. Built-in implementations:
 - **Lightning** — BOLT11 invoices via LDK-node (feature: `payments-ldk`)
-- **Solana** — SOL and SPL token transfers with reference-based payment detection (feature: `payments-solana`)
+- **Solana** — SOL transfers (native SOL only) with reference-based payment detection (feature: `payments-solana`)
 
 ### Payment Lifecycle
 
@@ -394,19 +394,19 @@ When `chain` is `"solana"`, the payment request string in the `amount` tag is a 
 {
   "recipient": "<base58-pubkey>",
   "amount": 10000000,
-  "reference": "<base58-pubkey>",
-  "mint": "<base58-pubkey>",
-  "decimals": 6
+  "reference": "<base58-pubkey>"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `recipient` | string | Yes | Provider's Solana address (base58). |
-| `amount` | integer | Yes | Amount in base units (lamports for SOL, smallest unit for SPL). |
+| `amount` | integer | Yes | Amount in lamports (native SOL). |
 | `reference` | string | Yes | Ephemeral reference pubkey for payment detection. Added as read-only non-signer to the transfer instruction. Provider polls `getSignaturesForAddress(reference)` to confirm payment. |
-| `mint` | string | No | SPL token mint address. Omitted for native SOL transfers. |
-| `decimals` | integer | No | Token decimal places. Omitted for native SOL transfers. |
+| `fee_address` | string | No | Solana address to receive the app developer fee. Present when fee is configured. |
+| `fee_amount` | integer | No | Fee amount in lamports. Present when fee is configured. |
+
+> **Note:** Fee fields are embedded by the provider. Customers MUST validate fee parameters before paying.
 
 ## Subscription Filters
 
@@ -483,7 +483,7 @@ The SDK uses `ElisymError` enum for all errors:
 | `NostrTag(...)` | Tag parsing errors. |
 | `Json(...)` | JSON serialization/deserialization errors. |
 | `InvalidCapabilityCard(String)` | Capability card validation failure (e.g., empty name). |
-| `Payment(String)` | Lightning/LDK errors (insufficient capacity, timeout, node not started, etc.). |
+| `Payment(String)` | Payment errors (insufficient capacity, timeout, node not started, etc.). |
 | `Config(String)` | Configuration errors (invalid relay, invalid address, etc.). |
 
 ### Malformed event handling
@@ -508,7 +508,7 @@ To implement a compatible client in any language:
 1. **Identity**: Generate a secp256k1 keypair (any Nostr library).
 2. **Discovery**: Publish `kind:31990` events with the tag structure above. Search with `#t = "elisym"` filter.
 3. **Jobs**: Submit `kind:5100` events with `["i", data, type]` tag. Subscribe to `kind:6100` and `kind:7000`.
-4. **Payments**: Parse BOLT11 from feedback `amount` tag. Pay with any Lightning implementation.
+4. **Payments**: Parse payment request from feedback `amount` tag. Pay via the appropriate payment backend.
 5. **Messages**: Use NIP-17 (NIP-44 + NIP-59) for private communication.
 
 The only elisym-specific convention is the `["t", "elisym"]` tag on capability cards. Everything else is standard NIP-89/NIP-90/NIP-17.

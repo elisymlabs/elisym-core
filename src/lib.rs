@@ -52,7 +52,7 @@ pub use payment::{PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus,
 pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
 
 #[cfg(feature = "payments-solana")]
-pub use payment::solana::{SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork, SolanaToken, USDC_MINT_MAINNET, USDC_MINT_DEVNET};
+pub use payment::solana::{SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork};
 
 use nostr_sdk::Client;
 
@@ -95,12 +95,15 @@ impl AgentNode {
         self.payments.as_ref()?.as_any().downcast_ref()
     }
 
-    /// Process a job with payment enforcement: generate invoice, send
+    /// Process a job with payment enforcement: generate payment request, send
     /// payment-required feedback, wait for payment, only then deliver result.
     ///
     /// This is the **recommended** way for providers to deliver paid results.
     /// Calling `submit_job_result()` directly skips payment verification.
     ///
+    /// This method creates a payment request without fees. For fee-aware
+    /// payments, use the provider-specific method (e.g.,
+    /// `SolanaPaymentProvider::create_payment_request_with_fee()`) directly.
     pub async fn process_job_with_payment(
         &self,
         job: &marketplace::JobRequest,
@@ -137,8 +140,10 @@ impl AgentNode {
             )
             .await?;
 
-        // 3. Poll for payment until confirmed or timeout
+        // 3. Poll for payment until confirmed or timeout (with backoff: 1s, 2s, 4s, 8s, 8s, ...)
         let deadline = tokio::time::Instant::now() + payment_timeout;
+        let mut poll_interval = std::time::Duration::from_secs(1);
+        let max_interval = std::time::Duration::from_secs(8);
         loop {
             if tokio::time::Instant::now() >= deadline {
                 // Send error feedback so customer knows
@@ -163,7 +168,10 @@ impl AgentNode {
                     tracing::info!(amount, "Payment confirmed");
                     break;
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+                _ => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval * 2).min(max_interval);
+                }
             }
         }
 
