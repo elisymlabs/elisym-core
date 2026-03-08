@@ -78,6 +78,12 @@ impl<T> Subscription<T> {
     }
 }
 
+impl<T> Drop for Subscription<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl<T> std::ops::Deref for Subscription<T> {
     type Target = mpsc::Receiver<T>;
     fn deref(&self) -> &Self::Target {
