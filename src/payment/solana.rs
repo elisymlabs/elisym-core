@@ -611,6 +611,26 @@ impl PaymentProvider for SolanaPaymentProvider {
                 let received = post.saturating_sub(pre);
 
                 if received >= expected_net {
+                    // Verify protocol fee was paid to treasury
+                    if let (Some(ref fee_addr), Some(fee_amt)) =
+                        (&data.fee_address, data.fee_amount)
+                    {
+                        if fee_amt > 0 {
+                            let fee_ok = account_keys
+                                .iter()
+                                .position(|k| k == fee_addr)
+                                .map(|fi| {
+                                    meta.post_balances[fi]
+                                        .saturating_sub(meta.pre_balances[fi])
+                                        >= fee_amt
+                                })
+                                .unwrap_or(false);
+                            if !fee_ok {
+                                continue;
+                            }
+                        }
+                    }
+
                     // Payment verified — mark as settled in cache so future lookups
                     // skip the on-chain query.
                     let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
