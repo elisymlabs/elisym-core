@@ -158,13 +158,13 @@ impl DiscoveryService {
                             // Fuzzy: split query into tokens, check if every token
                             // appears in at least one tag's tokens
                             let query_tokens: Vec<&str> =
-                                cap.split(|c: char| c == '-' || c == '_' || c == ' ')
+                                cap.split(['-', '_', ' '])
                                     .filter(|t| !t.is_empty())
                                     .collect();
                             query_tokens.iter().all(|qt| {
                                 let qt_lower = qt.to_lowercase();
                                 event_tags.iter().any(|tag| {
-                                    tag.split(|c: char| c == '-' || c == '_' || c == ' ')
+                                    tag.split(['-', '_', ' '])
                                         .any(|tt| tt.to_lowercase() == qt_lower)
                                 })
                             })
