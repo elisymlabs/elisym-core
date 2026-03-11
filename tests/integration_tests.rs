@@ -15,7 +15,12 @@ fn test_capability_card_roundtrip() {
         "A test agent for integration testing",
         vec!["capability-a".into(), "capability-b".into()],
     );
-    card.set_payment_address("test@wallet.example.com");
+    card.set_payment(PaymentInfo {
+        chain: "solana".into(),
+        network: "devnet".into(),
+        address: "test@wallet.example.com".into(),
+        job_price: None,
+    });
 
     let json = card.to_json().unwrap();
     let restored = CapabilityCard::from_json(&json).unwrap();
@@ -23,8 +28,9 @@ fn test_capability_card_roundtrip() {
     assert_eq!(restored.name, "test-agent");
     assert_eq!(restored.description, "A test agent for integration testing");
     assert_eq!(restored.capabilities.len(), 2);
-    assert_eq!(restored.payment_address.as_deref(), Some("test@wallet.example.com"));
-    assert_eq!(restored.protocol_version, PROTOCOL_VERSION);
+    let payment = restored.payment.unwrap();
+    assert_eq!(payment.address, "test@wallet.example.com");
+    assert_eq!(payment.chain, "solana");
 }
 
 #[test]
@@ -32,13 +38,12 @@ fn test_capability_card_without_optional_fields() {
     let card = CapabilityCard::new("minimal", "Minimal agent", vec![]);
     let json = card.to_json().unwrap();
 
-    // payment_address and metadata should not be in JSON when None
-    assert!(!json.contains("payment_address"));
-    assert!(!json.contains("metadata"));
+    // payment should not be in JSON when None
+    assert!(!json.contains("payment"));
 
     let restored = CapabilityCard::from_json(&json).unwrap();
     assert_eq!(restored.name, "minimal");
-    assert!(restored.payment_address.is_none());
+    assert!(restored.payment.is_none());
 }
 
 #[test]
@@ -48,6 +53,7 @@ fn test_job_status_display() {
     assert_eq!(JobStatus::Error.as_str(), "error");
     assert_eq!(JobStatus::Success.as_str(), "success");
     assert_eq!(JobStatus::Partial.as_str(), "partial");
+    assert_eq!(JobStatus::PaymentCompleted.as_str(), "payment-completed");
 }
 
 #[test]
@@ -77,18 +83,21 @@ fn test_kind_constants() {
 }
 
 #[test]
-fn test_protocol_version() {
-    assert_eq!(PROTOCOL_VERSION, "elisym/0.1");
-}
-
-#[test]
-fn test_capability_card_with_payment_address_only() {
-    let mut card = CapabilityCard::new("ln-agent", "Agent with payment address", vec![]);
-    card.set_payment_address("agent@wallet.com");
+fn test_capability_card_with_payment() {
+    let mut card = CapabilityCard::new("ln-agent", "Agent with payment", vec![]);
+    card.set_payment(PaymentInfo {
+        chain: "lightning".into(),
+        network: "mainnet".into(),
+        address: "agent@wallet.com".into(),
+        job_price: Some(1000),
+    });
 
     let json = card.to_json().unwrap();
-    assert!(json.contains("payment_address"));
+    assert!(json.contains("payment"));
 
     let restored = CapabilityCard::from_json(&json).unwrap();
-    assert_eq!(restored.payment_address.as_deref(), Some("agent@wallet.com"));
+    let payment = restored.payment.unwrap();
+    assert_eq!(payment.address, "agent@wallet.com");
+    assert_eq!(payment.chain, "lightning");
+    assert_eq!(payment.job_price, Some(1000));
 }
