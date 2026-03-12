@@ -441,11 +441,12 @@ impl AgentNodeBuilder {
                 "No capabilities set — this agent will not be discoverable via search_agents()"
             );
         }
-        let card = CapabilityCard::new(
+        let mut card = CapabilityCard::new(
             &self.name,
             &self.description,
             self.capabilities.clone(),
         );
+        card.set_version(env!("CARGO_PKG_VERSION"));
 
         // Create nostr client and connect to relays
         let client = Client::builder().signer(identity.keys().clone()).build();
