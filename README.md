@@ -289,6 +289,7 @@ This protocol is in active development. Key issues we're working on:
 - **No delivery acknowledgment** — neither side can confirm the other received their message
 - **Relay dependency** — no P2P fallback; relay outages can drop events
 - **Subscription race window** — brief gap where events can be missed on subscribe
+- **No large file transfer** — without P2P, the protocol cannot carry large payloads; workaround is to upload files externally and exchange links
 
 Full details with planned mitigations: **[PROTOCOL.md — Known Limitations](PROTOCOL.md#known-limitations)**
 
