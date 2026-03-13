@@ -327,6 +327,7 @@ pub struct AgentNodeBuilder {
     relays: Vec<String>,
     supported_job_kinds: Vec<u16>,
     secret_key: Option<String>,
+    picture_url: Option<String>,
     /// When `true`, `build()` publishes the Nostr profile (kind:0) and
     /// capability card (NIP-89) automatically. Default: `false`.
     publish_on_build: bool,
@@ -345,6 +346,7 @@ impl AgentNodeBuilder {
             relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
             supported_job_kinds: vec![KIND_JOB_REQUEST_BASE + DEFAULT_KIND_OFFSET],
             secret_key: None,
+            picture_url: None,
             publish_on_build: false,
             #[cfg(feature = "payments-ldk")]
             ldk_payment_config: None,
@@ -374,6 +376,11 @@ impl AgentNodeBuilder {
 
     pub fn secret_key(mut self, secret_key: impl Into<String>) -> Self {
         self.secret_key = Some(secret_key.into());
+        self
+    }
+
+    pub fn picture_url(mut self, url: impl Into<String>) -> Self {
+        self.picture_url = Some(url.into());
         self
     }
 
@@ -495,18 +502,21 @@ impl AgentNodeBuilder {
             let client_bg = client.clone();
             let name_bg = self.name.clone();
             let description_bg = self.description.clone();
-            let pubkey_hex = identity.public_key().to_hex();
+            let picture_url_bg = self.picture_url.clone();
             let discovery_bg = discovery.clone();
             let card_bg = card.clone();
             let capabilities_bg = self.capabilities.clone();
             let job_kinds_bg = self.supported_job_kinds.clone();
             tokio::spawn(async move {
                 // Publish NIP-01 kind:0 profile metadata (name, about, picture)
-                let picture_url = format!("https://robohash.org/{}", pubkey_hex);
-                let metadata = Metadata::new()
+                let mut metadata = Metadata::new()
                     .name(&name_bg)
-                    .about(&description_bg)
-                    .picture(Url::parse(&picture_url).expect("valid robohash URL"));
+                    .about(&description_bg);
+                if let Some(url) = &picture_url_bg {
+                    if let Ok(parsed) = Url::parse(url) {
+                        metadata = metadata.picture(parsed);
+                    }
+                }
                 match client_bg.set_metadata(&metadata).await {
                     Ok(output) => {
                         tracing::info!(event_id = %output.val, "Published Nostr profile (kind:0)");
