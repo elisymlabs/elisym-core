@@ -104,7 +104,7 @@ pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
 pub use payment::solana::{SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork};
 
 use std::sync::Arc;
-use nostr_sdk::{Client, Metadata, Url};
+use nostr_sdk::Client;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -499,34 +499,12 @@ impl AgentNodeBuilder {
         // Optionally publish profile and capability card in the background.
         // Only runs when the caller explicitly opted in via `.publish_on_build(true)`.
         if self.publish_on_build {
-            let client_bg = client.clone();
-            let name_bg = self.name.clone();
-            let description_bg = self.description.clone();
-            let picture_url_bg = self.picture_url.clone();
             let discovery_bg = discovery.clone();
             let card_bg = card.clone();
             let capabilities_bg = self.capabilities.clone();
             let job_kinds_bg = self.supported_job_kinds.clone();
             tokio::spawn(async move {
-                // Publish NIP-01 kind:0 profile metadata (name, about, picture)
-                let mut metadata = Metadata::new()
-                    .name(&name_bg)
-                    .about(&description_bg);
-                if let Some(url) = &picture_url_bg {
-                    if let Ok(parsed) = Url::parse(url) {
-                        metadata = metadata.picture(parsed);
-                    }
-                }
-                match client_bg.set_metadata(&metadata).await {
-                    Ok(output) => {
-                        tracing::info!(event_id = %output.val, "Published Nostr profile (kind:0)");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to publish Nostr profile, continuing");
-                    }
-                }
-
-                // Publish capability card (skip for customer-only agents with no capabilities)
+                // Publish capability card + kind:0 profile (skip for customer-only agents with no capabilities)
                 if !capabilities_bg.is_empty() {
                     if let Err(e) = discovery_bg
                         .publish_capability(&card_bg, &job_kinds_bg)
