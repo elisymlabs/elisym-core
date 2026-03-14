@@ -154,6 +154,7 @@ impl PaymentProvider for LdkPaymentProvider {
             Some(details) => Ok(PaymentStatus {
                 settled: details.status == ldk_node::payment::PaymentStatus::Succeeded,
                 amount: details.amount_msat,
+                tx_signature: None,
             }),
             None => Err(ElisymError::Payment("Payment not found".into())),
         }

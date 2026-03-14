@@ -121,6 +121,7 @@ struct PendingPayment {
     amount: u64,
     created_at: u64,
     settled: bool,
+    tx_signature: Option<String>,
 }
 
 /// Maximum number of entries allowed in the pending map before cleanup.
@@ -399,6 +400,7 @@ impl SolanaPaymentProvider {
                     amount,
                     created_at: now,
                     settled: false,
+                    tx_signature: None,
                 },
             );
         }
@@ -539,6 +541,7 @@ impl PaymentProvider for SolanaPaymentProvider {
                     return Ok(PaymentStatus {
                         settled: true,
                         amount: Some(p.amount),
+                        tx_signature: p.tx_signature.clone(),
                     });
                 }
             }
@@ -553,6 +556,7 @@ impl PaymentProvider for SolanaPaymentProvider {
             return Ok(PaymentStatus {
                 settled: false,
                 amount: None,
+                tx_signature: None,
             });
         }
 
@@ -576,6 +580,7 @@ impl PaymentProvider for SolanaPaymentProvider {
             return Ok(PaymentStatus {
                 settled: false,
                 amount: None,
+                tx_signature: None,
             });
         }
 
@@ -643,13 +648,16 @@ impl PaymentProvider for SolanaPaymentProvider {
 
                     // Payment verified — mark as settled in cache so future lookups
                     // skip the on-chain query.
+                    let sig_str = sig.to_string();
                     let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(p) = pending.get_mut(request) {
                         p.settled = true;
+                        p.tx_signature = Some(sig_str.clone());
                     }
                     return Ok(PaymentStatus {
                         settled: true,
                         amount: Some(received),
+                        tx_signature: Some(sig_str),
                     });
                 }
             }
@@ -659,6 +667,7 @@ impl PaymentProvider for SolanaPaymentProvider {
         Ok(PaymentStatus {
             settled: false,
             amount: None,
+            tx_signature: None,
         })
     }
 
@@ -819,6 +828,7 @@ mod tests {
                         amount: 1000,
                         created_at: now_secs(),
                         settled: true,
+                        tx_signature: None,
                     },
                 );
             }

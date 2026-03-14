@@ -65,6 +65,8 @@ pub struct PaymentStatus {
     pub settled: bool,
     /// Amount in the chain's base unit, if known.
     pub amount: Option<u64>,
+    /// Transaction signature/hash (e.g. Solana tx signature), if known.
+    pub tx_signature: Option<String>,
 }
 
 /// Core payment interface that all payment backends implement.
