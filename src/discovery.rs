@@ -33,6 +33,48 @@ pub struct AgentFilter {
     pub query: Option<String>,
 }
 
+/// Check if a single query capability matches any of the event's tags.
+///
+/// Matching is fuzzy: both the query and tags are split on delimiters (`-`, `_`, ` `)
+/// into tokens. A query token matches a tag token if they are equal or one is a prefix
+/// of the other (min 3 chars).
+fn matches_capability(query_cap: &str, event_tags: &HashSet<&str>) -> bool {
+    // Exact match first (fast path)
+    if event_tags.contains(query_cap) {
+        return true;
+    }
+    // Fuzzy: split query into tokens, check if every token
+    // appears in at least one tag's tokens
+    let query_tokens: Vec<&str> = query_cap
+        .split(['-', '_', ' '])
+        .filter(|t| !t.is_empty())
+        .collect();
+    query_tokens.iter().all(|qt| {
+        let qt_lower = qt.to_lowercase();
+        event_tags.iter().any(|tag| {
+            tag.split(['-', '_', ' ']).any(|tt| {
+                let tt_lower = tt.to_lowercase();
+                tt_lower == qt_lower
+                    || (qt_lower.len() >= 3 && tt_lower.starts_with(&qt_lower))
+                    || (tt_lower.len() >= 3 && qt_lower.starts_with(&tt_lower))
+            })
+        })
+    })
+}
+
+/// Check if a free-text query matches a capability card (name, description, or capabilities).
+fn matches_query(query: &str, card: &CapabilityCard) -> bool {
+    let q = query.to_lowercase();
+    let name_lower = card.name.to_lowercase();
+    let desc_lower = card.description.to_lowercase();
+    name_lower.contains(&q)
+        || desc_lower.contains(&q)
+        || card
+            .capabilities
+            .iter()
+            .any(|c| c.to_lowercase().contains(&q))
+}
+
 /// Service for publishing and discovering agent capabilities via NIP-89.
 #[derive(Debug, Clone)]
 pub struct DiscoveryService {
@@ -170,38 +212,14 @@ impl DiscoveryService {
 
                     // Post-filter: count how many requested capabilities match (OR with ranking).
                     // Agents matching at least 1 capability are included; more matches = higher rank.
-                    // Matching is fuzzy: both query terms and agent tags are split on
-                    // delimiters ('-', '_', ' ') into tokens. A query token matches a
-                    // tag token if they are equal OR one is a prefix of the other
-                    // (min 3 chars), so "stock" matches "stocks", "summarize" matches
-                    // "summarization", etc.
                     let match_count = if filter.capabilities.is_empty() {
                         0
                     } else {
-                        let count = filter.capabilities.iter().filter(|cap| {
-                            // Exact match first (fast path)
-                            if event_tags.contains(cap.as_str()) {
-                                return true;
-                            }
-                            // Fuzzy: split query into tokens, check if every token
-                            // appears in at least one tag's tokens
-                            let query_tokens: Vec<&str> =
-                                cap.split(['-', '_', ' '])
-                                    .filter(|t| !t.is_empty())
-                                    .collect();
-                            query_tokens.iter().all(|qt| {
-                                let qt_lower = qt.to_lowercase();
-                                event_tags.iter().any(|tag| {
-                                    tag.split(['-', '_', ' '])
-                                        .any(|tt| {
-                                            let tt_lower = tt.to_lowercase();
-                                            tt_lower == qt_lower
-                                                || (qt_lower.len() >= 3 && tt_lower.starts_with(&qt_lower))
-                                                || (tt_lower.len() >= 3 && qt_lower.starts_with(&tt_lower))
-                                        })
-                                })
-                            })
-                        }).count();
+                        let count = filter
+                            .capabilities
+                            .iter()
+                            .filter(|cap| matches_capability(cap, &event_tags))
+                            .count();
 
                         if count == 0 {
                             continue;
@@ -211,14 +229,7 @@ impl DiscoveryService {
 
                     // Post-filter: free-text query against name and description.
                     if let Some(ref query) = filter.query {
-                        let q = query.to_lowercase();
-                        let name_lower = card.name.to_lowercase();
-                        let desc_lower = card.description.to_lowercase();
-                        let caps_lower: Vec<String> = card.capabilities.iter().map(|c| c.to_lowercase()).collect();
-                        let matches = name_lower.contains(&q)
-                            || desc_lower.contains(&q)
-                            || caps_lower.iter().any(|c| c.contains(&q));
-                        if !matches {
+                        if !matches_query(query, &card) {
                             continue;
                         }
                     }
@@ -251,5 +262,98 @@ impl DiscoveryService {
         }
 
         Ok(agents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── matches_capability ──
+
+    #[test]
+    fn test_exact_match() {
+        let tags: HashSet<&str> = ["translation", "elisym"].into();
+        assert!(matches_capability("translation", &tags));
+    }
+
+    #[test]
+    fn test_no_match() {
+        let tags: HashSet<&str> = ["summarization"].into();
+        assert!(!matches_capability("translation", &tags));
+    }
+
+    #[test]
+    fn test_fuzzy_prefix_query_shorter() {
+        // "stock" is a prefix of "stocks" (len >= 3)
+        let tags: HashSet<&str> = ["stocks"].into();
+        assert!(matches_capability("stock", &tags));
+    }
+
+    #[test]
+    fn test_fuzzy_prefix_tag_shorter() {
+        // "summarization" starts with "summar" (tag token len >= 3)
+        let tags: HashSet<&str> = ["summar"].into();
+        assert!(matches_capability("summarization", &tags));
+    }
+
+    #[test]
+    fn test_compound_tag_token_split() {
+        // "text-summarization" splits into ["text", "summarization"]
+        // Both must match some tag token
+        let tags: HashSet<&str> = ["text", "summarization"].into();
+        assert!(matches_capability("text-summarization", &tags));
+    }
+
+    #[test]
+    fn test_case_insensitive() {
+        let tags: HashSet<&str> = ["translation"].into();
+        assert!(matches_capability("Translation", &tags));
+    }
+
+    #[test]
+    fn test_short_token_no_fuzzy() {
+        // "ai" is < 3 chars, so it won't fuzzy-prefix-match "aim"
+        let tags: HashSet<&str> = ["aim"].into();
+        assert!(!matches_capability("ai", &tags));
+    }
+
+    #[test]
+    fn test_compound_all_tokens_must_match() {
+        // "stock-analysis" requires both "stock" and "analysis"
+        let tags: HashSet<&str> = ["stocks"].into();
+        assert!(!matches_capability("stock-analysis", &tags));
+    }
+
+    #[test]
+    fn test_empty_tags_no_match() {
+        let tags: HashSet<&str> = HashSet::new();
+        assert!(!matches_capability("translation", &tags));
+    }
+
+    // ── matches_query ──
+
+    #[test]
+    fn test_query_matches_name() {
+        let card = CapabilityCard::new("Stock Analyzer", "Analyzes things", vec![]);
+        assert!(matches_query("stock", &card));
+    }
+
+    #[test]
+    fn test_query_matches_description() {
+        let card = CapabilityCard::new("Agent", "Translates text between languages", vec![]);
+        assert!(matches_query("translates", &card));
+    }
+
+    #[test]
+    fn test_query_matches_capability() {
+        let card = CapabilityCard::new("Agent", "Does stuff", vec!["summarization".into()]);
+        assert!(matches_query("summar", &card));
+    }
+
+    #[test]
+    fn test_query_no_match() {
+        let card = CapabilityCard::new("Agent", "Does stuff", vec!["coding".into()]);
+        assert!(!matches_query("translation", &card));
     }
 }

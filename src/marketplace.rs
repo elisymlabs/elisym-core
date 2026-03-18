@@ -1118,6 +1118,69 @@ mod tests {
 
     // ── job_request_kind / job_result_kind ──
 
+    // ── parsed_status ──
+
+    #[test]
+    fn test_parsed_status_all_known_variants() {
+        let request_event = make_event(5100, "", vec![
+            Tag::parse(["i", "data", "text"]).unwrap(),
+        ]);
+        let cases = vec![
+            ("payment-required", Some(JobStatus::PaymentRequired)),
+            ("payment-completed", Some(JobStatus::PaymentCompleted)),
+            ("processing", Some(JobStatus::Processing)),
+            ("error", Some(JobStatus::Error)),
+            ("success", Some(JobStatus::Success)),
+            ("partial", Some(JobStatus::Partial)),
+            ("unknown-status", None),
+        ];
+        for (status_str, expected) in cases {
+            let fb_event = make_event(7000, "", vec![
+                Tag::event(request_event.id),
+                Tag::parse(["status", status_str]).unwrap(),
+            ]);
+            let fb = parse_job_feedback(&fb_event).unwrap();
+            assert_eq!(fb.parsed_status(), expected, "status: {}", status_str);
+        }
+    }
+
+    // ── JobStatus serde ──
+
+    #[test]
+    fn test_job_status_serde_all_variants() {
+        let variants = vec![
+            (JobStatus::PaymentRequired, "\"payment-required\""),
+            (JobStatus::PaymentCompleted, "\"payment-completed\""),
+            (JobStatus::Processing, "\"processing\""),
+            (JobStatus::Error, "\"error\""),
+            (JobStatus::Success, "\"success\""),
+            (JobStatus::Partial, "\"partial\""),
+        ];
+        for (status, expected_json) in variants {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, expected_json);
+            let parsed: JobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    // ── AgentFilter serde ──
+
+    #[test]
+    fn test_agent_filter_skip_serializing_none() {
+        use crate::discovery::AgentFilter;
+        let filter = AgentFilter {
+            capabilities: vec!["translation".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        // limit and query should be absent (skip_serializing_if)
+        assert!(!json.contains("limit"));
+        assert!(!json.contains("query"));
+        // capabilities should be present
+        assert!(json.contains("translation"));
+    }
+
     #[test]
     fn test_job_kind_helpers() {
         use crate::types::{job_request_kind, job_result_kind};

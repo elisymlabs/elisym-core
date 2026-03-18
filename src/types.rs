@@ -90,3 +90,156 @@ impl std::fmt::Display for JobStatus {
         f.write_str(self.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── calculate_protocol_fee ──
+
+    #[test]
+    fn test_calculate_protocol_fee_normal() {
+        // 1_000_000 * 300 / 10_000 = 30_000
+        assert_eq!(calculate_protocol_fee(1_000_000), Some(30_000));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_zero() {
+        assert_eq!(calculate_protocol_fee(0), Some(0));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_rounds_up() {
+        // 1 * 300 / 10_000 = 0.03 → ceil = 1
+        assert_eq!(calculate_protocol_fee(1), Some(1));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_small_amount() {
+        // 100 * 300 / 10_000 = 3
+        assert_eq!(calculate_protocol_fee(100), Some(3));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_overflow_returns_none() {
+        // u64::MAX * 300 overflows → None
+        assert_eq!(calculate_protocol_fee(u64::MAX), None);
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_large_no_overflow() {
+        // u64::MAX / 300 won't overflow when multiplied by 300
+        let amount = u64::MAX / PROTOCOL_FEE_BPS;
+        assert!(calculate_protocol_fee(amount).is_some());
+    }
+
+    // ── format_bps_percent ──
+
+    #[test]
+    fn test_format_bps_percent_300() {
+        assert_eq!(format_bps_percent(300), "3.00%");
+    }
+
+    #[test]
+    fn test_format_bps_percent_zero() {
+        assert_eq!(format_bps_percent(0), "0.00%");
+    }
+
+    #[test]
+    fn test_format_bps_percent_one() {
+        assert_eq!(format_bps_percent(1), "0.01%");
+    }
+
+    #[test]
+    fn test_format_bps_percent_fifty() {
+        assert_eq!(format_bps_percent(50), "0.50%");
+    }
+
+    #[test]
+    fn test_format_bps_percent_10000() {
+        assert_eq!(format_bps_percent(10_000), "100.00%");
+    }
+
+    #[test]
+    fn test_format_bps_percent_12345() {
+        assert_eq!(format_bps_percent(12_345), "123.45%");
+    }
+
+    // ── job_request_kind ──
+
+    #[test]
+    fn test_job_request_kind_offset_0() {
+        assert_eq!(job_request_kind(0).unwrap().as_u16(), 5000);
+    }
+
+    #[test]
+    fn test_job_request_kind_offset_100() {
+        assert_eq!(job_request_kind(100).unwrap().as_u16(), 5100);
+    }
+
+    #[test]
+    fn test_job_request_kind_offset_999() {
+        assert_eq!(job_request_kind(999).unwrap().as_u16(), 5999);
+    }
+
+    #[test]
+    fn test_job_request_kind_offset_1000_returns_none() {
+        // 5000 + 1000 = 6000 which is >= KIND_JOB_RESULT_BASE
+        assert!(job_request_kind(1000).is_none());
+    }
+
+    #[test]
+    fn test_job_request_kind_max_offset_returns_none() {
+        // 5000 + 65535 overflows u16 or >= 6000
+        assert!(job_request_kind(u16::MAX).is_none());
+    }
+
+    // ── job_result_kind ──
+
+    #[test]
+    fn test_job_result_kind_offset_0() {
+        assert_eq!(job_result_kind(0).unwrap().as_u16(), 6000);
+    }
+
+    #[test]
+    fn test_job_result_kind_offset_100() {
+        assert_eq!(job_result_kind(100).unwrap().as_u16(), 6100);
+    }
+
+    #[test]
+    fn test_job_result_kind_offset_999() {
+        assert_eq!(job_result_kind(999).unwrap().as_u16(), 6999);
+    }
+
+    #[test]
+    fn test_job_result_kind_offset_1000_returns_none() {
+        // 6000 + 1000 = 7000 which is >= KIND_JOB_FEEDBACK
+        assert!(job_result_kind(1000).is_none());
+    }
+
+    // ── JobStatus ──
+
+    #[test]
+    fn test_job_status_display() {
+        assert_eq!(JobStatus::PaymentRequired.to_string(), "payment-required");
+        assert_eq!(JobStatus::Processing.to_string(), "processing");
+        assert_eq!(JobStatus::Success.to_string(), "success");
+    }
+
+    #[test]
+    fn test_job_status_serde_roundtrip() {
+        let statuses = vec![
+            JobStatus::PaymentRequired,
+            JobStatus::PaymentCompleted,
+            JobStatus::Processing,
+            JobStatus::Error,
+            JobStatus::Success,
+            JobStatus::Partial,
+        ];
+        for status in statuses {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: JobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+}

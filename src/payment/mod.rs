@@ -117,3 +117,93 @@ pub trait PaymentProvider: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PaymentChain Display ──
+
+    #[test]
+    fn test_payment_chain_display() {
+        assert_eq!(PaymentChain::Lightning.to_string(), "lightning");
+        assert_eq!(PaymentChain::Solana.to_string(), "solana");
+        assert_eq!(PaymentChain::BitcoinOnchain.to_string(), "bitcoin-onchain");
+        assert_eq!(PaymentChain::Ethereum.to_string(), "ethereum");
+        assert_eq!(PaymentChain::Custom("foo".into()).to_string(), "foo");
+    }
+
+    // ── PaymentChain PartialEq ──
+
+    #[test]
+    fn test_payment_chain_equality() {
+        assert_eq!(PaymentChain::Lightning, PaymentChain::Lightning);
+        assert_ne!(PaymentChain::Lightning, PaymentChain::Solana);
+        assert_eq!(
+            PaymentChain::Custom("x".into()),
+            PaymentChain::Custom("x".into())
+        );
+        assert_ne!(
+            PaymentChain::Custom("x".into()),
+            PaymentChain::Custom("y".into())
+        );
+    }
+
+    // ── Mock PaymentProvider for is_paid() ──
+
+    #[derive(Debug)]
+    struct MockProvider {
+        settled: bool,
+    }
+
+    impl PaymentProvider for MockProvider {
+        fn chain(&self) -> PaymentChain {
+            PaymentChain::Custom("mock".into())
+        }
+
+        fn create_payment_request(
+            &self,
+            _amount: u64,
+            _description: &str,
+            _expiry_secs: u32,
+        ) -> Result<PaymentRequest> {
+            Ok(PaymentRequest {
+                chain: self.chain(),
+                amount: 0,
+                currency_unit: "mock".into(),
+                request: "mock-request".into(),
+            })
+        }
+
+        fn pay(&self, _request: &str) -> Result<PaymentResult> {
+            Ok(PaymentResult {
+                payment_id: "mock-id".into(),
+                status: "ok".into(),
+            })
+        }
+
+        fn lookup_payment(&self, _request: &str) -> Result<PaymentStatus> {
+            Ok(PaymentStatus {
+                settled: self.settled,
+                amount: Some(1000),
+                tx_signature: None,
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_is_paid_returns_true_when_settled() {
+        let provider = MockProvider { settled: true };
+        assert!(provider.is_paid("req").unwrap());
+    }
+
+    #[test]
+    fn test_is_paid_returns_false_when_not_settled() {
+        let provider = MockProvider { settled: false };
+        assert!(!provider.is_paid("req").unwrap());
+    }
+}
+
