@@ -5,7 +5,7 @@
 //! instruction. The provider detects payment via `getSignaturesForAddress(reference)`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -22,6 +22,91 @@ use solana_transaction_status_client_types::{
 
 use crate::error::{ElisymError, Result};
 use crate::payment::{PaymentChain, PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus};
+
+/// Solana address of the protocol treasury that receives the protocol fee.
+pub const PROTOCOL_TREASURY: &str = "GY7vnWMkKpftU4nQ16C2ATkj1JwrQpHhknkaBUn67VTy";
+
+/// Validate fee fields on an already-parsed payment request.
+/// Checks treasury address, fee amount matches protocol fee, consistency of fee_address/fee_amount.
+/// Free jobs (amount=0, no fee fields) pass.
+fn validate_fee_fields_parsed(data: &SolanaPaymentRequestData) -> Result<()> {
+    // Free job — fee fields must be absent
+    if data.amount == 0 {
+        if data.fee_address.is_some() || data.fee_amount.is_some() {
+            return Err(ElisymError::Payment(
+                "Invalid fee params: fee fields must be absent for free jobs (amount=0).".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let expected_fee = crate::types::calculate_protocol_fee(data.amount)
+        .ok_or_else(|| ElisymError::Payment(
+            "Fee calculation overflow for the given amount".into()
+        ))?;
+
+    match (data.fee_address.as_deref(), data.fee_amount) {
+        (Some(addr), Some(amt)) => {
+            if amt == 0 {
+                return Err(ElisymError::Payment(
+                    "Invalid fee params: fee_amount is zero but fee_address present.".into()
+                ));
+            }
+            if addr != PROTOCOL_TREASURY {
+                return Err(ElisymError::Payment(format!(
+                    "Fee address mismatch: expected {PROTOCOL_TREASURY}, got {addr}. \
+                     Provider may be attempting to redirect fees."
+                )));
+            }
+            if amt != expected_fee {
+                return Err(ElisymError::Payment(format!(
+                    "Fee amount mismatch: expected {expected_fee} lamports ({}bps of {}), got {amt}. \
+                     Provider may be tampering with fee.",
+                    crate::types::PROTOCOL_FEE_BPS, data.amount
+                )));
+            }
+            Ok(())
+        }
+        (Some(_), None) => {
+            Err(ElisymError::Payment(
+                "Invalid fee params: fee_address present but fee_amount missing.".into()
+            ))
+        }
+        (None, Some(_)) => {
+            Err(ElisymError::Payment(
+                "Invalid fee params: fee_amount present but fee_address missing.".into()
+            ))
+        }
+        (None, None) => {
+            Err(ElisymError::Payment(format!(
+                "Payment request missing protocol fee ({}bps). \
+                 Expected fee: {expected_fee} lamports to {PROTOCOL_TREASURY}.",
+                crate::types::PROTOCOL_FEE_BPS
+            )))
+        }
+    }
+}
+
+/// Check that the actual recipient matches the expected one.
+fn check_recipient(actual: &str, expected: &str) -> Result<()> {
+    if actual != expected {
+        return Err(ElisymError::Payment(format!(
+            "Recipient mismatch: expected {expected}, got {actual}. \
+             Provider may be attempting to redirect payment.",
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that a payment request has the correct recipient and protocol fee params.
+/// `expected_recipient` is the provider's Solana address from their capability card.
+pub fn validate_protocol_fee(request: &str, expected_recipient: &str) -> Result<()> {
+    let data: SolanaPaymentRequestData = serde_json::from_str(request)
+        .map_err(|e| ElisymError::Payment(format!("Invalid payment request JSON: {e}")))?;
+
+    check_recipient(&data.recipient, expected_recipient)?;
+    validate_fee_fields_parsed(&data)
+}
 
 /// Solana network selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,8 +222,11 @@ pub struct SolanaPaymentProvider {
     keypair: Keypair,
     rpc_client: RpcClient,
     pending: Mutex<HashMap<String, PendingPayment>>,
-    /// Maximum fee percentage allowed in `pay()`, in basis points (default: 1000 = 10%).
-    max_fee_bps: u64,
+    /// Cached rent-exempt minimum for 0-data accounts (lock-free after first init).
+    rent_exempt_cache: OnceLock<u64>,
+    /// Expected recipient address for trait `pay()` validation. If set, `pay()` will
+    /// reject requests whose recipient doesn't match.
+    expected_recipient: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for SolanaPaymentProvider {
@@ -151,9 +239,6 @@ impl std::fmt::Debug for SolanaPaymentProvider {
 }
 
 impl SolanaPaymentProvider {
-    /// Default maximum fee in basis points (1000 = 10%).
-    const DEFAULT_MAX_FEE_BPS: u64 = 1000;
-
     /// Create a new Solana payment provider with the given config and keypair.
     pub fn new(config: SolanaPaymentConfig, keypair: Keypair) -> Self {
         let rpc_url = config.effective_rpc_url();
@@ -163,14 +248,25 @@ impl SolanaPaymentProvider {
             keypair,
             rpc_client,
             pending: Mutex::new(HashMap::new()),
-            max_fee_bps: Self::DEFAULT_MAX_FEE_BPS,
+            rent_exempt_cache: OnceLock::new(),
+            expected_recipient: None,
         }
     }
 
-    /// Set the maximum fee percentage (in basis points) that `pay()` will accept.
-    /// 100 bps = 1%. Default is 1000 bps (10%).
-    pub fn set_max_fee_bps(&mut self, bps: u64) {
-        self.max_fee_bps = bps;
+    /// Create a new Solana payment provider with a pre-configured expected recipient.
+    ///
+    /// Preferred over calling [`Self::new`] + [`Self::set_expected_recipient`] separately,
+    /// as it ensures recipient validation is active from the first `pay()` call.
+    pub fn new_with_recipient(config: SolanaPaymentConfig, keypair: Keypair, expected_recipient: &str) -> Self {
+        let mut provider = Self::new(config, keypair);
+        provider.expected_recipient = Some(Arc::from(expected_recipient));
+        provider
+    }
+
+    /// Set the expected recipient address for trait `pay()` validation.
+    /// When set, `pay()` will reject requests whose recipient doesn't match.
+    pub fn set_expected_recipient(&mut self, addr: &str) {
+        self.expected_recipient = Some(Arc::from(addr));
     }
 
     /// Create from a base58-encoded secret key.
@@ -244,6 +340,66 @@ impl SolanaPaymentProvider {
         )
     }
 
+    /// Create a payment request with the protocol fee automatically applied.
+    /// Internally calculates fee via `calculate_protocol_fee()` and uses `PROTOCOL_TREASURY`.
+    pub fn create_payment_request_with_protocol_fee(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<PaymentRequest> {
+        if amount == 0 {
+            return Err(ElisymError::Payment("Payment amount must be greater than 0".into()));
+        }
+        let fee_amount = crate::types::calculate_protocol_fee(amount)
+            .ok_or_else(|| ElisymError::Payment("Fee calculation overflow".into()))?;
+        self.create_payment_request_with_fee(amount, description, expiry_secs, PROTOCOL_TREASURY, fee_amount)
+    }
+
+    /// Send SOL directly to an address — **not** a protocol job payment.
+    ///
+    /// This method bypasses protocol fee validation and recipient checks because
+    /// it is intended for user-initiated direct transfers (e.g., `elisym send`),
+    /// not for paying job invoices.
+    ///
+    /// For job payments, use [`pay_validated`] or the [`PaymentProvider::pay`] trait method.
+    pub fn send_sol(&self, recipient: &str, lamports: u64) -> Result<PaymentResult> {
+        if lamports == 0 {
+            return Err(ElisymError::Payment("Send amount must be greater than 0".into()));
+        }
+        let recipient_pubkey: Pubkey = recipient
+            .parse()
+            .map_err(|e| ElisymError::Payment(format!("Invalid recipient address: {e:?}")))?;
+
+        let recent_blockhash = self
+            .rpc_client
+            .get_latest_blockhash()
+            .map_err(|e| ElisymError::Payment(format!("Failed to get blockhash: {e}")))?;
+
+        #[allow(deprecated)]
+        let ix = solana_sdk::system_instruction::transfer(
+            &self.keypair.pubkey(),
+            &recipient_pubkey,
+            lamports,
+        );
+        let message = Message::new_with_blockhash(
+            &[ix],
+            Some(&self.keypair.pubkey()),
+            &recent_blockhash,
+        );
+        let tx = Transaction::new(&[&self.keypair], message, recent_blockhash);
+
+        let sig = self
+            .rpc_client
+            .send_and_confirm_transaction(&tx)
+            .map_err(|e| ElisymError::Payment(format!("Transaction failed: {e}")))?;
+
+        Ok(PaymentResult {
+            payment_id: sig.to_string(),
+            status: "confirmed".to_string(),
+        })
+    }
+
     /// Request an airdrop of SOL (devnet/testnet only).
     pub fn request_airdrop(&self, lamports: u64) -> Result<String> {
         let sig = self
@@ -299,45 +455,59 @@ impl SolanaPaymentProvider {
         Ok(tx)
     }
 
-    /// Validate fee parameters in an untrusted payment request.
-    ///
-    /// Checks that the fee address matches the expected address and the fee
-    /// percentage doesn't exceed the maximum allowed (in basis points: 100 = 1%).
-    ///
-    /// Call this **before** `pay()` to verify that a provider hasn't embedded
-    /// malicious fee parameters in their payment request.
-    pub fn validate_fee_params(
-        request: &str,
-        expected_fee_address: &str,
-        max_fee_bps: u64,
-    ) -> Result<()> {
-        let data: SolanaPaymentRequestData = serde_json::from_str(request)
-            .map_err(|e| ElisymError::Payment(format!("Invalid payment request: {}", e)))?;
-
-        match (&data.fee_address, data.fee_amount) {
-            (Some(addr), Some(amt)) if amt > 0 => {
-                if addr != expected_fee_address {
-                    return Err(ElisymError::Payment(format!(
-                        "Fee address mismatch: expected {}, got {}",
-                        expected_fee_address, addr
-                    )));
-                }
-                if data.amount == 0 {
-                    return Err(ElisymError::Payment(
-                        "Invalid payment request: amount is 0 but fee is non-zero".into(),
-                    ));
-                }
-                let fee_bps = (amt as u128 * 10_000) / data.amount as u128;
-                if fee_bps > max_fee_bps as u128 {
-                    return Err(ElisymError::Payment(format!(
-                        "Fee too high: {}bps exceeds max {}bps",
-                        fee_bps, max_fee_bps
-                    )));
-                }
-                Ok(())
-            }
-            _ => Ok(()),
+    /// Query Solana for the minimum balance for rent exemption (0-data account).
+    /// Result is cached after the first successful RPC call.
+    pub fn get_rent_exempt_minimum(&self) -> Result<u64> {
+        if let Some(&v) = self.rent_exempt_cache.get() {
+            return Ok(v);
         }
+        let v = self.rpc_client
+            .get_minimum_balance_for_rent_exemption(0)
+            .map_err(|e| ElisymError::Payment(format!("Failed to get rent-exempt minimum: {e}")))?;
+        // If another thread raced us, that's fine — use whichever value got there first.
+        let _ = self.rent_exempt_cache.set(v);
+        Ok(self.rent_exempt_cache.get().copied().unwrap_or(v))
+    }
+
+    /// Validate that this provider's net amount (price minus protocol fee) is above
+    /// Solana's rent-exempt minimum. Intended for **provider self-validation** —
+    /// checks `self.keypair` balance to determine if the account already exists.
+    /// Free mode (lamports == 0) is always valid.
+    ///
+    /// **Note:** This method performs RPC calls (balance check, rent-exempt minimum).
+    /// In async contexts, wrap in `tokio::task::spawn_blocking()`.
+    ///
+    /// **TOCTOU:** The balance check is subject to time-of-check/time-of-use — the
+    /// account may be closed between validation and actual payment. This is acceptable
+    /// for provider self-check at publish time.
+    pub fn validate_job_price_with_rpc(&self, lamports: u64) -> Result<()> {
+        if lamports == 0 {
+            return Ok(()); // free mode
+        }
+        let fee = crate::types::calculate_protocol_fee(lamports)
+            .ok_or_else(|| ElisymError::Payment("Fee calculation overflow".into()))?;
+        let provider_net = lamports.saturating_sub(fee);
+
+        // If provider account already exists, rent-exempt minimum doesn't apply
+        let balance = self.rpc_client.get_balance(&self.keypair.pubkey())
+            .map_err(|e| ElisymError::Payment(format!("Failed to check account balance: {e}")))?;
+        if balance > 0 {
+            return Ok(());
+        }
+
+        // New account — check rent-exempt minimum (cached)
+        let rent_min = self.get_rent_exempt_minimum()?;
+
+        if provider_net < rent_min {
+            return Err(ElisymError::Payment(format!(
+                "Price too low: after {} protocol fee the provider receives {} lamports, \
+                 below rent-exempt minimum ({} lamports). Account does not exist yet.",
+                crate::types::format_bps_percent(crate::types::PROTOCOL_FEE_BPS),
+                provider_net,
+                rent_min
+            )));
+        }
+        Ok(())
     }
 
     /// Shared logic for creating a payment request, with optional fee.
@@ -358,6 +528,7 @@ impl SolanaPaymentProvider {
         let reference_keypair = Keypair::new();
         let reference = reference_keypair.pubkey();
 
+        let protocol_fee = fee.as_ref().map(|(_, amt)| *amt);
         let (fee_address, fee_amount) = match fee {
             Some((addr, amt)) => (Some(addr), Some(amt)),
             None => (None, None),
@@ -410,46 +581,14 @@ impl SolanaPaymentProvider {
             amount,
             currency_unit: "lamport".to_string(),
             request,
+            fee_amount: protocol_fee,
         })
     }
 }
 
-impl PaymentProvider for SolanaPaymentProvider {
-    fn chain(&self) -> PaymentChain {
-        PaymentChain::Solana
-    }
-
-    fn create_payment_request(
-        &self,
-        amount: u64,
-        description: &str,
-        expiry_secs: u32,
-    ) -> Result<PaymentRequest> {
-        self.create_payment_request_inner(amount, description, expiry_secs, None)
-    }
-
-    /// Pay a Solana payment request by sending a SOL transfer on-chain.
-    ///
-    /// # Security — payment request is untrusted data
-    ///
-    /// The `request` string is deserialized from a NIP-90 feedback event. While
-    /// the Nostr event itself is signed by the provider, the JSON payment request
-    /// inside it is plain text with no integrity protection at the SDK level.
-    ///
-    /// Callers **MUST** verify:
-    /// 1. **Recipient address** — ensure it matches the expected provider. The SDK
-    ///    does not validate this automatically. Compare `data.recipient` against the
-    ///    provider's known Solana address before calling `pay()`.
-    /// 2. **Fee parameters** — use [`SolanaPaymentProvider::validate_fee_params`]
-    ///    to check `fee_address` and `fee_amount`. A malicious provider could set
-    ///    an arbitrary fee address or inflate the fee amount.
-    ///
-    /// A built-in `max_fee_bps` safety rail rejects fees exceeding the configured
-    /// maximum (default: 10%), but this does not replace explicit validation.
-    fn pay(&self, request: &str) -> Result<PaymentResult> {
-        let data: SolanaPaymentRequestData = serde_json::from_str(request)
-            .map_err(|e| ElisymError::Payment(format!("Invalid payment request: {}", e)))?;
-
+impl SolanaPaymentProvider {
+    /// Internal payment execution from pre-parsed request data — no re-parsing.
+    fn pay_internal_parsed(&self, data: SolanaPaymentRequestData) -> Result<PaymentResult> {
         // Check expiry before sending funds
         if data.is_expired() {
             return Err(ElisymError::Payment(
@@ -467,39 +606,17 @@ impl PaymentProvider for SolanaPaymentProvider {
             .parse()
             .map_err(|e| ElisymError::Payment(format!("Invalid reference pubkey: {:?}", e)))?;
 
-        // Parse optional fee parameters.
-        // SECURITY: fee_address and fee_amount come from the untrusted payment
-        // request created by the provider. Callers MUST validate these values
-        // against their expected fee configuration before calling pay().
+        // Parse optional fee parameters (validation already done by validate_fee_fields_parsed).
         let fee_params = match (data.fee_address, data.fee_amount) {
             (Some(addr), Some(amt)) if amt > 0 => {
-                let fee_bps = if data.amount > 0 {
-                    (amt as u128 * 10_000 / data.amount as u128) as u64
-                } else {
-                    0
-                };
-                tracing::warn!(
-                    fee_address = %addr,
-                    fee_amount = amt,
-                    total_amount = data.amount,
-                    fee_bps = fee_bps,
-                    "Payment request contains fee parameters — ensure these were validated before calling pay()"
-                );
+                // Defense-in-depth: fee must be strictly less than total amount.
+                // This should never trigger if validate_fee_fields_parsed ran, but guards
+                // against a provider_amount=0 transfer if the check is somehow bypassed.
                 if amt >= data.amount {
                     return Err(ElisymError::Payment(format!(
-                        "fee_amount ({}) must be less than total amount ({})",
-                        amt, data.amount
+                        "fee_amount ({amt}) must be less than total amount ({})",
+                        data.amount
                     )));
-                }
-                // Safety rail: reject fees exceeding max_fee_bps
-                if data.amount > 0 {
-                    let fee_bps_val = (amt as u128 * 10_000) / data.amount as u128;
-                    if fee_bps_val > self.max_fee_bps as u128 {
-                        return Err(ElisymError::Payment(format!(
-                            "Fee {}bps exceeds max {}bps — call validate_fee_params() or set_max_fee_bps()",
-                            fee_bps_val, self.max_fee_bps
-                        )));
-                    }
                 }
                 let fee_pubkey: Pubkey = addr.parse().map_err(|e| {
                     ElisymError::Payment(format!("Invalid fee address: {:?}", e))
@@ -520,6 +637,71 @@ impl PaymentProvider for SolanaPaymentProvider {
             payment_id: sig.to_string(),
             status: "confirmed".to_string(),
         })
+    }
+
+    /// Pay a payment request with full validation (fee fields + recipient).
+    ///
+    /// Convenience method when the expected recipient is known at call time rather
+    /// than at provider construction time. Equivalent to `pay()` but takes the
+    /// expected recipient as a parameter instead of requiring [`set_expected_recipient`].
+    ///
+    /// | Check                  | `pay()` (trait)        | `pay_validated()` |
+    /// |------------------------|:----------------------:|:-----------------:|
+    /// | Fee treasury address   | Yes                    | Yes               |
+    /// | Fee amount (3% exact)  | Yes                    | Yes               |
+    /// | Recipient address      | Yes (via constructor)  | Yes (via param)   |
+    /// | Expiry                 | Yes                    | Yes               |
+    ///
+    /// - `expected_recipient`: the provider's Solana address from their capability card
+    pub fn pay_validated(&self, request: &str, expected_recipient: &str) -> Result<PaymentResult> {
+        let data: SolanaPaymentRequestData = serde_json::from_str(request)
+            .map_err(|e| ElisymError::Payment(format!("Invalid payment request JSON: {e}")))?;
+        validate_fee_fields_parsed(&data)?;
+        check_recipient(&data.recipient, expected_recipient)?;
+        self.pay_internal_parsed(data)
+    }
+}
+
+impl PaymentProvider for SolanaPaymentProvider {
+    fn chain(&self) -> PaymentChain {
+        PaymentChain::Solana
+    }
+
+    fn create_payment_request(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<PaymentRequest> {
+        self.create_payment_request_with_protocol_fee(amount, description, expiry_secs)
+    }
+
+    /// Pay a Solana payment request by sending a SOL transfer on-chain.
+    ///
+    /// Automatically validates protocol fee fields (treasury address, fee amount)
+    /// and recipient address. Free jobs (amount=0, no fee fields) are allowed.
+    ///
+    /// **Requires** [`SolanaPaymentProvider::set_expected_recipient`] or
+    /// [`SolanaPaymentProvider::new_with_recipient`] to be called first.
+    /// Returns an error if no expected recipient is configured — this prevents
+    /// a malicious provider from redirecting funds to an arbitrary address.
+    ///
+    /// For one-off payments where the recipient is known at call time, use
+    /// [`SolanaPaymentProvider::pay_validated`] instead.
+    fn pay(&self, request: &str) -> Result<PaymentResult> {
+        let expected = self.expected_recipient.as_deref().ok_or_else(|| {
+            ElisymError::Payment(
+                "pay() requires expected_recipient to be set for recipient validation. \
+                 Call set_expected_recipient() / new_with_recipient(), or use pay_validated(). \
+                 Without recipient validation, a malicious provider can redirect funds."
+                    .into(),
+            )
+        })?;
+        let data: SolanaPaymentRequestData = serde_json::from_str(request)
+            .map_err(|e| ElisymError::Payment(format!("Invalid payment request JSON: {e}")))?;
+        validate_fee_fields_parsed(&data)?;
+        check_recipient(&data.recipient, expected)?;
+        self.pay_internal_parsed(data)
     }
 
     /// Look up the status of a Solana payment by its request string.
@@ -811,6 +993,9 @@ mod tests {
         // Verify the request string is valid JSON with expected fields
         let data: SolanaPaymentRequestData = serde_json::from_str(&req.request).unwrap();
         assert_eq!(data.amount, 10_000_000);
+        // create_payment_request now auto-applies protocol fee
+        assert_eq!(data.fee_address.as_deref(), Some(PROTOCOL_TREASURY));
+        assert_eq!(data.fee_amount, Some(300_000)); // 3% of 10M
     }
 
     #[test]
@@ -876,114 +1061,21 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_fee_params_valid() {
-        let data = SolanaPaymentRequestData {
-            recipient: "11111111111111111111111111111111".to_string(),
-            amount: 100_000,
-            reference: "22222222222222222222222222222222".to_string(),
-            description: None,
-            fee_address: Some("FeeAddr111111111111111111111111".to_string()),
-            fee_amount: Some(3_000), // 3%
-            created_at: now_secs(),
-            expiry_secs: 3600,
-        };
-        let json = serde_json::to_string(&data).unwrap();
-
-        // Valid: correct address, within limit (500 bps = 5%)
-        assert!(SolanaPaymentProvider::validate_fee_params(&json, "FeeAddr111111111111111111111111", 500).is_ok());
-    }
-
-    #[test]
-    fn test_validate_fee_params_wrong_address() {
-        let data = SolanaPaymentRequestData {
-            recipient: "11111111111111111111111111111111".to_string(),
-            amount: 100_000,
-            reference: "22222222222222222222222222222222".to_string(),
-            description: None,
-            fee_address: Some("EvilAddr11111111111111111111111".to_string()),
-            fee_amount: Some(3_000),
-            created_at: now_secs(),
-            expiry_secs: 3600,
-        };
-        let json = serde_json::to_string(&data).unwrap();
-
-        let result = SolanaPaymentProvider::validate_fee_params(&json, "FeeAddr111111111111111111111111", 500);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("mismatch"));
-    }
-
-    #[test]
-    fn test_validate_fee_params_too_high() {
-        let data = SolanaPaymentRequestData {
-            recipient: "11111111111111111111111111111111".to_string(),
-            amount: 100_000,
-            reference: "22222222222222222222222222222222".to_string(),
-            description: None,
-            fee_address: Some("FeeAddr111111111111111111111111".to_string()),
-            fee_amount: Some(50_000), // 50%
-            created_at: now_secs(),
-            expiry_secs: 3600,
-        };
-        let json = serde_json::to_string(&data).unwrap();
-
-        let result = SolanaPaymentProvider::validate_fee_params(&json, "FeeAddr111111111111111111111111", 500);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too high"));
-    }
-
-    #[test]
-    fn test_validate_fee_params_zero_amount() {
-        // Crafted malicious request with amount=0 should not panic
-        let data = SolanaPaymentRequestData {
-            recipient: "11111111111111111111111111111111".to_string(),
-            amount: 0,
-            reference: "22222222222222222222222222222222".to_string(),
-            description: None,
-            fee_address: Some("FeeAddr111111111111111111111111".to_string()),
-            fee_amount: Some(1),
-            created_at: now_secs(),
-            expiry_secs: 3600,
-        };
-        let json = serde_json::to_string(&data).unwrap();
-
-        let result = SolanaPaymentProvider::validate_fee_params(&json, "FeeAddr111111111111111111111111", 500);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("amount is 0"));
-    }
-
-    #[test]
-    fn test_validate_fee_params_no_fee_ok() {
-        let data = SolanaPaymentRequestData {
-            recipient: "11111111111111111111111111111111".to_string(),
-            amount: 100_000,
-            reference: "22222222222222222222222222222222".to_string(),
-            description: None,
-            fee_address: None,
-            fee_amount: None,
-            created_at: now_secs(),
-            expiry_secs: 3600,
-        };
-        let json = serde_json::to_string(&data).unwrap();
-
-        assert!(SolanaPaymentProvider::validate_fee_params(&json, "anything", 500).is_ok());
-    }
-
-    #[test]
     fn test_pay_rejects_excessive_fee() {
         let keypair = Keypair::new();
-        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
-        // Use valid Solana pubkeys (base58-encoded 32-byte keys)
         let recipient = Keypair::new().pubkey().to_string();
+        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        provider.set_expected_recipient(&recipient);
         let reference = Keypair::new().pubkey().to_string();
-        let fee_addr = Keypair::new().pubkey().to_string();
-        // Construct a request with 50% fee (5000 bps) — exceeds default 1000 bps max
+        // Construct a request with 50% fee (5000 bps) — exceeds protocol fee
+        // Use PROTOCOL_TREASURY so it passes fee address validation but fails on amount mismatch
         let data = SolanaPaymentRequestData {
             recipient,
             amount: 100_000,
             reference,
             description: None,
-            fee_address: Some(fee_addr),
-            fee_amount: Some(50_000), // 50%
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(50_000), // 50% — wrong amount for protocol fee
             created_at: now_secs(),
             expiry_secs: 3600,
         };
@@ -991,34 +1083,67 @@ mod tests {
         let result = provider.pay(&json);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("exceeds max"), "unexpected error: {}", err_msg);
+        assert!(
+            err_msg.contains("Fee amount mismatch"),
+            "unexpected error: {}", err_msg
+        );
     }
 
     #[test]
     fn test_pay_allows_fee_within_limit() {
         let keypair = Keypair::new();
-        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
-        provider.set_max_fee_bps(500); // 5%
         let recipient = Keypair::new().pubkey().to_string();
+        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        provider.set_expected_recipient(&recipient);
         let reference = Keypair::new().pubkey().to_string();
-        let fee_addr = Keypair::new().pubkey().to_string();
-        // 3% fee should pass the safety rail (will fail later on RPC, which is fine)
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap(); // correct protocol fee
         let data = SolanaPaymentRequestData {
             recipient,
-            amount: 100_000,
+            amount,
             reference,
             description: None,
-            fee_address: Some(fee_addr),
-            fee_amount: Some(3_000), // 3%
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(fee),
             created_at: now_secs(),
             expiry_secs: 3600,
         };
         let json = serde_json::to_string(&data).unwrap();
         let result = provider.pay(&json);
-        // Should NOT fail with fee error — will fail on RPC instead
-        if let Err(e) = &result {
-            assert!(!e.to_string().contains("exceeds max"), "fee should be accepted: {}", e);
-        }
+        // Should pass fee + recipient validation — must fail on RPC (no network)
+        assert!(result.is_err(), "expected RPC error in test env");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(!err_msg.contains("Fee"), "fee should be accepted: {}", err_msg);
+        assert!(!err_msg.contains("Recipient"), "recipient should pass: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pay_rejects_without_expected_recipient() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        // No set_expected_recipient — pay() must reject
+        let recipient = Keypair::new().pubkey().to_string();
+        let reference = Keypair::new().pubkey().to_string();
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let data = SolanaPaymentRequestData {
+            recipient,
+            amount,
+            reference,
+            description: None,
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(fee),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("expected_recipient"),
+            "should require expected_recipient: {}", err_msg
+        );
     }
 
     #[test]
@@ -1029,5 +1154,321 @@ mod tests {
         let data: SolanaPaymentRequestData = serde_json::from_str(&req.request).unwrap();
         assert!(data.created_at > 0);
         assert_eq!(data.expiry_secs, 3600);
+    }
+
+    // ── calculate_protocol_fee ─────────────────────────────────────
+
+    #[test]
+    fn test_calculate_protocol_fee_standard() {
+        assert_eq!(crate::types::calculate_protocol_fee(10_000_000), Some(300_000));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_rounds_up() {
+        // 10_000_001 * 300 = 3_000_000_300, div_ceil(10_000) = 300_001
+        assert_eq!(crate::types::calculate_protocol_fee(10_000_001), Some(300_001));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_one_lamport() {
+        // 1 * 300 = 300, div_ceil(10_000) = 1
+        assert_eq!(crate::types::calculate_protocol_fee(1), Some(1));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_zero() {
+        assert_eq!(crate::types::calculate_protocol_fee(0), Some(0));
+    }
+
+    #[test]
+    fn test_calculate_protocol_fee_overflow() {
+        // Very large value that overflows checked_mul
+        assert_eq!(crate::types::calculate_protocol_fee(u64::MAX), None);
+    }
+
+    // ── format_bps_percent ─────────────────────────────────────────
+
+    #[test]
+    fn test_format_bps_percent() {
+        assert_eq!(crate::types::format_bps_percent(300), "3.00%");
+        assert_eq!(crate::types::format_bps_percent(0), "0.00%");
+        assert_eq!(crate::types::format_bps_percent(50), "0.50%");
+        assert_eq!(crate::types::format_bps_percent(10000), "100.00%");
+    }
+
+    // ── validate_protocol_fee ──────────────────────────────────────
+
+    fn make_payment_json(amount: u64, fee_address: Option<&str>, fee_amount: Option<u64>) -> String {
+        let mut obj = serde_json::json!({
+            "recipient": "SomeAddress",
+            "amount": amount,
+            "reference": "ref123",
+            "created_at": now_secs(),
+            "expiry_secs": 3600,
+        });
+        if let Some(addr) = fee_address {
+            obj["fee_address"] = serde_json::json!(addr);
+        }
+        if let Some(amt) = fee_amount {
+            obj["fee_amount"] = serde_json::json!(amt);
+        }
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_valid() {
+        let amount = 10_000_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
+        assert!(validate_protocol_fee(&json, "SomeAddress").is_ok());
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_wrong_treasury() {
+        let amount = 10_000_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let json = make_payment_json(amount, Some("WrongAddress"), Some(fee));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("Fee address mismatch"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_wrong_amount() {
+        let amount = 10_000_000u64;
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(1));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("Fee amount mismatch"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_missing() {
+        let json = make_payment_json(10_000_000, None, None);
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("missing protocol fee"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_invalid_json() {
+        assert!(validate_protocol_fee("not json", "SomeAddress").is_err());
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_recipient_mismatch() {
+        let amount = 10_000_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
+        let err = validate_protocol_fee(&json, "DifferentAddress").unwrap_err();
+        assert!(err.to_string().contains("Recipient mismatch"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_fee_address_without_amount() {
+        let json = make_payment_json(10_000_000, Some(PROTOCOL_TREASURY), None);
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("fee_address present but fee_amount missing"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_fee_amount_without_address() {
+        let json = make_payment_json(10_000_000, None, Some(300_000));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("fee_amount present but fee_address missing"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_zero_fee_amount() {
+        let json = make_payment_json(10_000_000, Some(PROTOCOL_TREASURY), Some(0));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("fee_amount is zero but fee_address present"));
+    }
+
+    #[test]
+    fn test_validate_protocol_fee_free_job() {
+        // amount=0, no fee fields — should be Ok
+        let json = make_payment_json(0, None, None);
+        assert!(validate_protocol_fee(&json, "SomeAddress").is_ok());
+    }
+
+    #[test]
+    fn test_pay_rejects_wrong_treasury() {
+        let keypair = Keypair::new();
+        let recipient = Keypair::new().pubkey().to_string();
+        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        provider.set_expected_recipient(&recipient);
+        let reference = Keypair::new().pubkey().to_string();
+        let wrong_treasury = Keypair::new().pubkey().to_string();
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let data = SolanaPaymentRequestData {
+            recipient,
+            amount,
+            reference,
+            description: None,
+            fee_address: Some(wrong_treasury),
+            fee_amount: Some(fee),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Fee address mismatch"), "unexpected error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pay_rejects_missing_fee() {
+        let keypair = Keypair::new();
+        let recipient = Keypair::new().pubkey().to_string();
+        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        provider.set_expected_recipient(&recipient);
+        let reference = Keypair::new().pubkey().to_string();
+        // Paid job (amount > 0) without fee fields
+        let data = SolanaPaymentRequestData {
+            recipient,
+            amount: 100_000,
+            reference,
+            description: None,
+            fee_address: None,
+            fee_amount: None,
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("missing protocol fee"), "unexpected error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pay_allows_free_job() {
+        let keypair = Keypair::new();
+        let recipient = Keypair::new().pubkey().to_string();
+        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        provider.set_expected_recipient(&recipient);
+        let reference = Keypair::new().pubkey().to_string();
+        // Free job: amount=0, no fee
+        let data = SolanaPaymentRequestData {
+            recipient,
+            amount: 0,
+            reference,
+            description: None,
+            fee_address: None,
+            fee_amount: None,
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay(&json);
+        // Should pass fee + recipient validation — must fail on RPC (no network), not on fee
+        assert!(result.is_err(), "expected RPC error in test env");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(!err_msg.contains("fee"), "free job should pass fee validation: {}", err_msg);
+        assert!(!err_msg.contains("protocol fee"), "free job should pass: {}", err_msg);
+    }
+
+    // ── create_payment_request_with_protocol_fee ───────────────────
+
+    #[test]
+    fn test_create_payment_request_with_protocol_fee() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let req = provider.create_payment_request_with_protocol_fee(10_000_000, "test", 3600).unwrap();
+        let data: SolanaPaymentRequestData = serde_json::from_str(&req.request).unwrap();
+        assert_eq!(data.amount, 10_000_000);
+        assert_eq!(data.fee_address.as_deref(), Some(PROTOCOL_TREASURY));
+        assert_eq!(data.fee_amount, Some(300_000)); // 3% of 10M
+    }
+
+    #[test]
+    fn test_create_payment_request_with_protocol_fee_overflow() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let result = provider.create_payment_request_with_protocol_fee(u64::MAX, "test", 3600);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("overflow"));
+    }
+
+    // ── recipient validation in pay() ─────────────────────────────
+
+    #[test]
+    fn test_pay_validates_recipient_when_set() {
+        let keypair = Keypair::new();
+        let mut provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        provider.set_expected_recipient("ExpectedAddress");
+
+        let recipient = Keypair::new().pubkey().to_string(); // different from expected
+        let reference = Keypair::new().pubkey().to_string();
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let data = SolanaPaymentRequestData {
+            recipient,
+            amount,
+            reference,
+            description: None,
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(fee),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Recipient mismatch"), "unexpected error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pay_validated_checks_recipient() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let recipient = Keypair::new().pubkey().to_string();
+        let reference = Keypair::new().pubkey().to_string();
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let data = SolanaPaymentRequestData {
+            recipient,
+            amount,
+            reference,
+            description: None,
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(fee),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay_validated(&json, "WrongRecipient");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Recipient mismatch"),
+            "should fail on recipient: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pay_validated_passes_with_correct_recipient() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let recipient = Keypair::new().pubkey().to_string();
+        let reference = Keypair::new().pubkey().to_string();
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let data = SolanaPaymentRequestData {
+            recipient: recipient.clone(),
+            amount,
+            reference,
+            description: None,
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(fee),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay_validated(&json, &recipient);
+        // Should pass all validation — must fail on RPC (no network)
+        assert!(result.is_err(), "expected RPC error in test env");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(!err_msg.contains("Recipient"), "should pass recipient: {}", err_msg);
+        assert!(!err_msg.contains("Fee"), "should pass fee: {}", err_msg);
     }
 }

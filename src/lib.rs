@@ -101,7 +101,10 @@ impl<T> std::ops::DerefMut for Subscription<T> {
 pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
 
 #[cfg(feature = "payments-solana")]
-pub use payment::solana::{SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork};
+pub use payment::solana::{
+    SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork,
+    PROTOCOL_TREASURY, validate_protocol_fee,
+};
 
 use std::sync::Arc;
 use nostr_sdk::Client;
@@ -161,9 +164,11 @@ impl AgentNode {
     /// This is the **recommended** way for providers to deliver paid results.
     /// Calling `submit_job_result()` directly skips payment verification.
     ///
-    /// This method creates a payment request without fees. For fee-aware
-    /// payments, use the provider-specific method (e.g.,
-    /// `SolanaPaymentProvider::create_payment_request_with_fee()`) directly.
+    /// For Solana, the protocol fee (3%) is automatically included via
+    /// `create_payment_request()` (which delegates to
+    /// `create_payment_request_with_protocol_fee()`). For custom fee
+    /// setups, use `SolanaPaymentProvider::create_payment_request_with_fee()`
+    /// directly instead of this method.
     ///
     /// # Cancellation safety
     ///

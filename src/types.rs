@@ -23,6 +23,22 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.nostr.band",
 ];
 
+/// Protocol fee in basis points (300 = 3%).
+pub const PROTOCOL_FEE_BPS: u64 = 300;
+
+/// Calculate protocol fee for a given amount (integer-only, rounds up).
+/// Returns `None` on overflow.
+pub fn calculate_protocol_fee(amount: u64) -> Option<u64> {
+    amount.checked_mul(PROTOCOL_FEE_BPS).map(|v| v.div_ceil(10_000))
+}
+
+/// Format basis points as percentage string (300 → "3.00%"). Integer-only.
+pub fn format_bps_percent(bps: u64) -> String {
+    let whole = bps / 100;
+    let frac = bps % 100;
+    format!("{}.{:02}%", whole, frac)
+}
+
 /// Helper to create a Kind from a u16
 pub fn kind(k: u16) -> Kind {
     Kind::from(k)
