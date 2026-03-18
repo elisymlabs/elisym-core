@@ -384,12 +384,49 @@ impl SolanaPaymentProvider {
         self.create_payment_request_with_fee(amount, description, expiry_secs, PROTOCOL_TREASURY, fee_amount)
     }
 
-    /// Request an airdrop of SOL (devnet/testnet only).
-    pub fn request_airdrop(&self, lamports: u64) -> Result<String> {
+    /// Send a direct SOL transfer (no protocol fee, no reference key).
+    ///
+    /// This is a simple wallet-to-wallet transfer for user-initiated sends,
+    /// bypassing the marketplace payment request flow.
+    pub fn send_transfer(&self, recipient: &str, lamports: u64) -> Result<String> {
+        if lamports == 0 {
+            return Err(ElisymError::Payment("Send amount must be greater than 0".into()));
+        }
+
+        if lamports < RENT_EXEMPT_MINIMUM {
+            return Err(ElisymError::Payment(format!(
+                "Amount {} lamports is below rent-exempt minimum ({} lamports). \
+                 Sending less would create a non-viable account.",
+                lamports, RENT_EXEMPT_MINIMUM,
+            )));
+        }
+
+        let recipient_pubkey: Pubkey = recipient
+            .parse()
+            .map_err(|e| ElisymError::Payment(format!("Invalid Solana address: {e:?}")))?;
+
+        let sender = self.keypair.pubkey();
+        if sender == recipient_pubkey {
+            return Err(ElisymError::Payment("Cannot send SOL to your own address".into()));
+        }
+
+        let recent_blockhash = self
+            .rpc_client
+            .get_latest_blockhash()
+            .map_err(|e| ElisymError::Payment(format!("Failed to get blockhash: {e}")))?;
+
+        // system_instruction::transfer is deprecated in favor of transfer_with_seed / newer API,
+        // but remains correct for simple SOL transfers without derived addresses.
+        #[allow(deprecated)]
+        let ix = solana_sdk::system_instruction::transfer(&sender, &recipient_pubkey, lamports);
+        let message = Message::new_with_blockhash(&[ix], Some(&sender), &recent_blockhash);
+        let tx = Transaction::new(&[&self.keypair], message, recent_blockhash);
+
         let sig = self
             .rpc_client
-            .request_airdrop(&self.keypair.pubkey(), lamports)
-            .map_err(|e| ElisymError::Payment(format!("Airdrop failed: {}", e)))?;
+            .send_and_confirm_transaction(&tx)
+            .map_err(|e| ElisymError::Payment(format!("Transaction failed: {e}")))?;
+
         Ok(sig.to_string())
     }
 

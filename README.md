@@ -194,7 +194,7 @@ Node: `node_id()`, `stop()`
 Access via `agent.ldk_payments()` for LDK-specific methods.
 
 **SolanaPaymentProvider** (feature = "payments-solana"): Native SOL transfers.
-Wallet: `address()`, `balance()`, `request_airdrop(lamports)`
+Wallet: `address()`, `balance()`, `send_transfer(recipient, lamports)`
 Constructors: `new(config, keypair)`, `from_secret_key(config, base58)`, `from_bytes(config, bytes)`
 Fee: `create_payment_request_with_protocol_fee(amount, desc, expiry)` (auto-applies 3% to treasury), `create_payment_request_with_fee(amount, desc, expiry, fee_addr, fee_amt)` (custom fee)
 Validation: `validate_protocol_fee(request, expected_recipient)` (public function), `pay_validated(request, expected_recipient)`
