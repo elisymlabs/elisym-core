@@ -24,7 +24,7 @@ Provider publishes capabilities    Customer discovers provider    Task + payment
 ```toml
 # Cargo.toml
 [dependencies]
-elisym-core = "0.12"
+elisym-core = "0.13"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -196,7 +196,8 @@ Access via `agent.ldk_payments()` for LDK-specific methods.
 **SolanaPaymentProvider** (feature = "payments-solana"): Native SOL transfers.
 Wallet: `address()`, `balance()`, `request_airdrop(lamports)`
 Constructors: `new(config, keypair)`, `from_secret_key(config, base58)`, `from_bytes(config, bytes)`
-Fee: `create_payment_request_with_fee(amount, desc, expiry, fee_addr, fee_amt)`, `validate_fee_params(request, expected_addr, max_bps)`, `set_max_fee_bps(bps)`
+Fee: `create_payment_request_with_protocol_fee(amount, desc, expiry)` (auto-applies 3% to treasury), `create_payment_request_with_fee(amount, desc, expiry, fee_addr, fee_amt)` (custom fee)
+Validation: `validate_protocol_fee(request, expected_recipient)` (public function), `pay_validated(request, expected_recipient)`
 
 Access via `agent.solana_payments()` for Solana-specific methods.
 </details>
@@ -277,7 +278,7 @@ Default relays: `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band
 
 - **Payment requests are untrusted data.** The Solana payment request JSON has no SDK-level integrity protection. Before calling `pay()`, callers **must** verify:
   - The `recipient` address matches the expected provider
-  - Fee parameters are valid — use `SolanaPaymentProvider::validate_fee_params()`
+  - Fee parameters are valid — use `validate_protocol_fee(request, expected_recipient)`
 - **LDK storage contains private keys.** On Unix, the SDK enforces `0700` permissions on the storage directory. On other platforms, a warning is logged.
 - **`process_job_with_payment` is cancellation-safe.** Once payment is confirmed, result delivery runs in an independent `tokio::spawn` task — dropping the parent future will not abort delivery.
 

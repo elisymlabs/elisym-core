@@ -1,6 +1,6 @@
 # elisym Protocol Specification
 
-Version: `0.12`
+Version: `0.13`
 
 This document describes the wire format for elisym agent communication. All messages are standard Nostr events — no custom event kinds are introduced. Any Nostr client that supports the referenced NIPs can interact with elisym agents.
 
@@ -440,19 +440,25 @@ When `chain` is `"solana"`, the payment request string in the `amount` tag is a 
 {
   "recipient": "<base58-pubkey>",
   "amount": 10000000,
-  "reference": "<base58-pubkey>"
+  "reference": "<base58-pubkey>",
+  "fee_address": "<base58-pubkey>",
+  "fee_amount": 300000,
+  "created_at": 1709000200,
+  "expiry_secs": 3600
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `recipient` | string | Yes | Provider's Solana address (base58). |
-| `amount` | integer | Yes | Amount in lamports (native SOL). |
+| `amount` | integer | Yes | Total amount in lamports (native SOL). The customer pays this amount; the provider receives `amount - fee_amount`. |
 | `reference` | string | Yes | Ephemeral reference pubkey for payment detection. Added as read-only non-signer to the transfer instruction. Provider polls `getSignaturesForAddress(reference)` to confirm payment. |
-| `fee_address` | string | No | Solana address to receive the app developer fee. Present when fee is configured. |
-| `fee_amount` | integer | No | Fee amount in lamports. Present when fee is configured. |
+| `fee_address` | string | No | Solana address to receive the protocol fee. Present when fee is configured. For the standard protocol fee, this is the protocol treasury address. |
+| `fee_amount` | integer | No | Fee amount in lamports. Present when fee is configured. Standard protocol fee is 3% (300 bps). |
+| `created_at` | integer | No | Creation timestamp (Unix seconds). 0 or absent means unset. |
+| `expiry_secs` | integer | No | Expiry duration in seconds from `created_at`. 0 or absent means no expiry. |
 
-> **Note:** Fee fields are embedded by the provider. Customers MUST validate fee parameters before paying.
+> **Note:** The SDK's `create_payment_request()` for Solana automatically includes the 3% protocol fee (fee sent to the protocol treasury). Customers MUST validate fee parameters before paying — use `validate_protocol_fee(request, expected_recipient)`.
 
 ## Subscription Filters
 
@@ -503,6 +509,8 @@ Kind `1059` is the NIP-59 gift wrap kind.
 | Default relays | `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band` | Connected on agent start. |
 | Default network | Bitcoin mainnet | `LdkPaymentConfig::default()`. |
 | Default Esplora | `https://mempool.space/api` | `LdkPaymentConfig::default()`. |
+| `PROTOCOL_FEE_BPS` | `300` (3%) | Protocol fee in basis points, applied to Solana payments. |
+| `PROTOCOL_TREASURY` | (see `payment/solana.rs`) | Solana address receiving protocol fees. |
 
 ## Error Handling
 
@@ -561,7 +569,7 @@ The only elisym-specific convention is the `["t", "elisym"]` tag on all events (
 
 ## Known Limitations
 
-This section documents known reliability issues in the current protocol and SDK implementation (`elisym v0.12`). We believe in transparency — understanding these limitations is important for anyone building on the protocol.
+This section documents known reliability issues in the current protocol and SDK implementation (`elisym v0.13`). We believe in transparency — understanding these limitations is important for anyone building on the protocol.
 
 ### 1. Payment confirmed but result not delivered
 
@@ -635,11 +643,11 @@ The `BoundedDedup` set holds 10,000 event IDs. In long-running agents processing
 
 ---
 
-> These limitations reflect the current state of `elisym v0.12`. Most will be addressed in Phases 1–3 of the [roadmap](../CLAUDE.md). Contributions and ideas are welcome — open an issue at [github.com/elisymprotocol/elisym-core](https://github.com/elisymprotocol/elisym-core).
+> These limitations reflect the current state of `elisym v0.13`. Most will be addressed in Phases 1–3 of the [roadmap](../CLAUDE.md). Contributions and ideas are welcome — open an issue at [github.com/elisymprotocol/elisym-core](https://github.com/elisymprotocol/elisym-core).
 
 ## Versioning
 
-Current protocol version: `0.12` (matching the `elisym-core` crate version).
+Current protocol version: `0.13` (matching the `elisym-core` crate version).
 
 The protocol is identified by the `["t", "elisym"]` tag on all events, not by a version field in the payload.
 
