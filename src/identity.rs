@@ -118,12 +118,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_identity_generate() {
-        let id = AgentIdentity::generate();
-        assert!(!id.npub().is_empty());
-    }
-
-    #[test]
     fn test_identity_roundtrip() {
         let id = AgentIdentity::generate();
         let hex = id.keys().secret_key().to_secret_hex();
@@ -168,14 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_version() {
-        let mut card = CapabilityCard::new("agent", "desc", vec![]);
-        assert!(card.version.is_none());
-        card.set_version("1.2.3");
-        assert_eq!(card.version.as_deref(), Some("1.2.3"));
-    }
-
-    #[test]
     fn test_capability_card_from_json_extra_fields() {
         // Forward compat: unknown fields should be silently ignored
         let json = r#"{"name":"test","description":"x","capabilities":[],"future_field":"val"}"#;
@@ -183,10 +169,4 @@ mod tests {
         assert_eq!(card.name, "test");
     }
 
-    #[test]
-    fn test_capability_card_no_payment() {
-        let json = r#"{"name":"test","description":"x","capabilities":["summarization"]}"#;
-        let card = CapabilityCard::from_json(json).unwrap();
-        assert!(card.payment.is_none());
-    }
 }

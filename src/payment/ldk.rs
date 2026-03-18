@@ -477,6 +477,26 @@ impl LdkPaymentProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ldk_config_defaults() {
+        let config = LdkPaymentConfig::default();
+        assert_eq!(config.network, ldk_node::bitcoin::Network::Bitcoin);
+        assert_eq!(config.esplora_url, DEFAULT_ESPLORA_URL);
+        assert!(config.listening_address.is_none());
+    }
+
+    #[test]
+    fn test_ldk_provider_chain() {
+        let config = LdkPaymentConfig::default();
+        let provider = LdkPaymentProvider::new(config);
+        assert_eq!(provider.chain(), PaymentChain::Lightning);
+    }
+}
+
 impl Drop for LdkPaymentProvider {
     fn drop(&mut self) {
         // Use take() so we don't try to stop twice if stop() was already called

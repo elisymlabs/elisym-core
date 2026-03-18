@@ -93,4 +93,41 @@ mod tests {
         assert!(d.insert(2)); // 2 was evicted too
         assert!(!d.insert(4)); // 4 is still in the set
     }
+
+    #[test]
+    fn test_dedup_zero_capacity_clamped_to_one() {
+        let mut d = BoundedDedup::new(0);
+        assert_eq!(d.capacity, 1);
+        assert!(d.insert(1));
+        assert!(!d.insert(1)); // duplicate
+        // Capacity is 1, so inserting 2 evicts 1
+        assert!(d.insert(2));
+        assert!(d.insert(1)); // 1 was evicted, new again
+    }
+
+    #[test]
+    fn test_dedup_all_unique_no_eviction() {
+        let mut d = BoundedDedup::new(10);
+        for i in 0..10 {
+            assert!(d.insert(i), "item {} should be new", i);
+        }
+        assert_eq!(d.set.len(), 10);
+        // All still present
+        for i in 0..10 {
+            assert!(!d.insert(i), "item {} should be duplicate", i);
+        }
+    }
+
+    #[test]
+    fn test_dedup_reinsert_after_eviction() {
+        let mut d = BoundedDedup::new(3);
+        assert!(d.insert(1));
+        assert!(d.insert(2));
+        assert!(d.insert(3));
+        // Evict 1 by inserting 4
+        assert!(d.insert(4));
+        assert!(!d.set.contains(&1));
+        // Re-insert 1 — should be "new"
+        assert!(d.insert(1));
+    }
 }

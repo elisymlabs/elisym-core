@@ -1409,6 +1409,171 @@ mod tests {
             "should fail on recipient: {}", err_msg);
     }
 
+    // ── network_name ──────────────────────────────────────────────
+
+    #[test]
+    fn test_network_name_mainnet() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(
+            SolanaPaymentConfig { network: SolanaNetwork::Mainnet, rpc_url: None },
+            keypair,
+        );
+        assert_eq!(provider.network_name(), "mainnet");
+    }
+
+    #[test]
+    fn test_network_name_devnet() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        assert_eq!(provider.network_name(), "devnet");
+    }
+
+    #[test]
+    fn test_network_name_testnet() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(
+            SolanaPaymentConfig { network: SolanaNetwork::Testnet, rpc_url: None },
+            keypair,
+        );
+        assert_eq!(provider.network_name(), "testnet");
+    }
+
+    #[test]
+    fn test_network_name_custom() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(
+            SolanaPaymentConfig {
+                network: SolanaNetwork::Custom("http://localhost:8899".to_string()),
+                rpc_url: None,
+            },
+            keypair,
+        );
+        assert_eq!(provider.network_name(), "custom");
+    }
+
+    // ── from_secret_key / from_bytes constructors ────────────────
+
+    #[test]
+    fn test_from_secret_key_invalid_base58() {
+        let result = SolanaPaymentProvider::from_secret_key(
+            SolanaPaymentConfig::default(),
+            "not-valid-base58!!!",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid base58"));
+    }
+
+    #[test]
+    fn test_from_bytes_wrong_length() {
+        let result = SolanaPaymentProvider::from_bytes(
+            SolanaPaymentConfig::default(),
+            &[1, 2, 3, 4], // too short
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid keypair"));
+    }
+
+    #[test]
+    fn test_from_secret_key_valid() {
+        let keypair = Keypair::new();
+        let expected_address = keypair.pubkey().to_string();
+        let base58_secret = bs58::encode(keypair.to_bytes()).into_string();
+        let provider = SolanaPaymentProvider::from_secret_key(
+            SolanaPaymentConfig::default(),
+            &base58_secret,
+        )
+        .unwrap();
+        assert_eq!(provider.address(), expected_address);
+    }
+
+    // ── validate_job_price ───────────────────────────────────────
+
+    #[test]
+    fn test_validate_job_price_free() {
+        assert!(validate_job_price(0, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_job_price_above_threshold() {
+        assert!(validate_job_price(RENT_EXEMPT_MINIMUM * 2, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_job_price_below_rent_exempt() {
+        let result = validate_job_price(1000, false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Price too low"));
+    }
+
+    #[test]
+    fn test_validate_job_price_account_funded_skips_rent_check() {
+        assert!(validate_job_price(1000, true).is_ok());
+    }
+
+    // ── new_with_recipient ───────────────────────────────────────
+
+    #[test]
+    fn test_new_with_recipient_rejects_wrong_recipient() {
+        let keypair = Keypair::new();
+        let expected = Keypair::new().pubkey().to_string();
+        let provider = SolanaPaymentProvider::new_with_recipient(
+            SolanaPaymentConfig::default(),
+            keypair,
+            &expected,
+        );
+        // Build a request with a different recipient
+        let wrong_recipient = Keypair::new().pubkey().to_string();
+        let reference = Keypair::new().pubkey().to_string();
+        let amount = 100_000u64;
+        let fee = crate::types::calculate_protocol_fee(amount).unwrap();
+        let data = SolanaPaymentRequestData {
+            recipient: wrong_recipient,
+            amount,
+            reference,
+            description: None,
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(fee),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let result = provider.pay(&json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Recipient mismatch"));
+    }
+
+    // ── create_payment_request_with_fee edge case ────────────────
+
+    #[test]
+    fn test_create_payment_request_with_fee_amount_exceeds() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let result = provider.create_payment_request_with_fee(
+            100_000, "test", 3600, PROTOCOL_TREASURY, 100_000,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fee_amount must be less than amount"));
+    }
+
+    // ── validate_fee_fields_parsed: free job with fee fields ─────
+
+    #[test]
+    fn test_validate_fee_fields_free_job_with_fee() {
+        let data = SolanaPaymentRequestData {
+            recipient: "11111111111111111111111111111111".to_string(),
+            amount: 0,
+            reference: "22222222222222222222222222222222".to_string(),
+            description: None,
+            fee_address: Some(PROTOCOL_TREASURY.to_string()),
+            fee_amount: Some(1000),
+            created_at: now_secs(),
+            expiry_secs: 3600,
+        };
+        let result = validate_fee_fields_parsed(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fee fields must be absent for free jobs"));
+    }
+
     #[test]
     fn test_pay_validated_passes_with_correct_recipient() {
         let keypair = Keypair::new();
@@ -1434,5 +1599,46 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(!err_msg.contains("Recipient"), "should pass recipient: {}", err_msg);
         assert!(!err_msg.contains("Fee"), "should pass fee: {}", err_msg);
+    }
+
+    // ── send_transfer validation tests ──────────────────────────────
+
+    #[test]
+    fn test_send_transfer_zero_amount() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let recipient = Keypair::new().pubkey().to_string();
+        let result = provider.send_transfer(&recipient, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn test_send_transfer_below_rent_exempt() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let recipient = Keypair::new().pubkey().to_string();
+        let result = provider.send_transfer(&recipient, 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("rent-exempt minimum"));
+    }
+
+    #[test]
+    fn test_send_transfer_invalid_recipient() {
+        let keypair = Keypair::new();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let result = provider.send_transfer("not-a-pubkey", 1_000_000_000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid Solana address"));
+    }
+
+    #[test]
+    fn test_send_transfer_self_send() {
+        let keypair = Keypair::new();
+        let own_address = keypair.pubkey().to_string();
+        let provider = SolanaPaymentProvider::new(SolanaPaymentConfig::default(), keypair);
+        let result = provider.send_transfer(&own_address, 1_000_000_000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cannot send SOL to your own address"));
     }
 }

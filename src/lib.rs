@@ -343,6 +343,40 @@ pub struct AgentNodeBuilder {
     solana_payment_provider: Option<payment::solana::SolanaPaymentProvider>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_subscription_recv_via_deref() {
+        let (tx, rx) = mpsc::channel::<u32>(8);
+        let handle = tokio::spawn(async {});
+        let mut sub = Subscription::new(rx, handle);
+        tx.send(42).await.unwrap();
+        let val = sub.recv().await.unwrap();
+        assert_eq!(val, 42);
+    }
+
+    #[tokio::test]
+    async fn test_subscription_drop_aborts_task() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        let (_tx, rx) = mpsc::channel::<u32>(8);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        {
+            let _sub = Subscription::new(rx, handle);
+            // _sub dropped here
+        }
+        // Give a moment for abort to propagate
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
 impl AgentNodeBuilder {
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
