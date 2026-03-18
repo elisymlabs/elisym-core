@@ -5,7 +5,7 @@
 //! instruction. The provider detects payment via `getSignaturesForAddress(reference)`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -106,6 +106,37 @@ pub fn validate_protocol_fee(request: &str, expected_recipient: &str) -> Result<
 
     check_recipient(&data.recipient, expected_recipient)?;
     validate_fee_fields_parsed(&data)
+}
+
+/// Solana rent-exempt minimum for a 0-data account (lamports).
+/// Formula: (128 + data_len) × rent_rate × exemption_years
+///        = (128 + 0) × 3.48e-3 SOL/byte/year × 2 years
+///        = 128 × 0.00348 × 2 × 1_000_000_000 = 890_880 lamports
+/// This value has never changed since Solana genesis. If rent parameters
+/// are ever updated via governance, this constant must be revised.
+pub const RENT_EXEMPT_MINIMUM: u64 = 890_880;
+
+/// Validate that provider's net amount (price − protocol fee) ≥ rent-exempt minimum.
+///
+/// Free mode (0) is always valid. If `account_funded` is `true`, the rent-exempt
+/// check is skipped (the recipient account already exists on-chain).
+pub fn validate_job_price(lamports: u64, account_funded: bool) -> Result<()> {
+    if lamports == 0 {
+        return Ok(());
+    }
+    let fee = crate::types::calculate_protocol_fee(lamports)
+        .ok_or_else(|| ElisymError::Payment("Fee calculation overflow".into()))?;
+    let provider_net = lamports.saturating_sub(fee);
+    if !account_funded && provider_net < RENT_EXEMPT_MINIMUM {
+        return Err(ElisymError::Payment(format!(
+            "Price too low: after {} protocol fee the provider receives {} lamports, \
+             below rent-exempt minimum ({} lamports).",
+            crate::types::format_bps_percent(crate::types::PROTOCOL_FEE_BPS),
+            provider_net,
+            RENT_EXEMPT_MINIMUM,
+        )));
+    }
+    Ok(())
 }
 
 /// Solana network selection.
@@ -222,8 +253,6 @@ pub struct SolanaPaymentProvider {
     keypair: Keypair,
     rpc_client: RpcClient,
     pending: Mutex<HashMap<String, PendingPayment>>,
-    /// Cached rent-exempt minimum for 0-data accounts (lock-free after first init).
-    rent_exempt_cache: OnceLock<u64>,
     /// Expected recipient address for trait `pay()` validation. If set, `pay()` will
     /// reject requests whose recipient doesn't match.
     expected_recipient: Option<Arc<str>>,
@@ -248,7 +277,6 @@ impl SolanaPaymentProvider {
             keypair,
             rpc_client,
             pending: Mutex::new(HashMap::new()),
-            rent_exempt_cache: OnceLock::new(),
             expected_recipient: None,
         }
     }
@@ -409,61 +437,6 @@ impl SolanaPaymentProvider {
             Message::new_with_blockhash(&instructions, Some(&self.keypair.pubkey()), &recent_blockhash);
         let tx = Transaction::new(&[&self.keypair], message, recent_blockhash);
         Ok(tx)
-    }
-
-    /// Query Solana for the minimum balance for rent exemption (0-data account).
-    /// Result is cached after the first successful RPC call.
-    pub fn get_rent_exempt_minimum(&self) -> Result<u64> {
-        if let Some(&v) = self.rent_exempt_cache.get() {
-            return Ok(v);
-        }
-        let v = self.rpc_client
-            .get_minimum_balance_for_rent_exemption(0)
-            .map_err(|e| ElisymError::Payment(format!("Failed to get rent-exempt minimum: {e}")))?;
-        // If another thread raced us, that's fine — use whichever value got there first.
-        let _ = self.rent_exempt_cache.set(v);
-        Ok(self.rent_exempt_cache.get().copied().unwrap_or(v))
-    }
-
-    /// Validate that this provider's net amount (price minus protocol fee) is above
-    /// Solana's rent-exempt minimum. Intended for **provider self-validation** —
-    /// checks `self.keypair` balance to determine if the account already exists.
-    /// Free mode (lamports == 0) is always valid.
-    ///
-    /// **Note:** This method performs RPC calls (balance check, rent-exempt minimum).
-    /// In async contexts, wrap in `tokio::task::spawn_blocking()`.
-    ///
-    /// **TOCTOU:** The balance check is subject to time-of-check/time-of-use — the
-    /// account may be closed between validation and actual payment. This is acceptable
-    /// for provider self-check at publish time.
-    pub fn validate_job_price_with_rpc(&self, lamports: u64) -> Result<()> {
-        if lamports == 0 {
-            return Ok(()); // free mode
-        }
-        let fee = crate::types::calculate_protocol_fee(lamports)
-            .ok_or_else(|| ElisymError::Payment("Fee calculation overflow".into()))?;
-        let provider_net = lamports.saturating_sub(fee);
-
-        // If provider account already exists, rent-exempt minimum doesn't apply
-        let balance = self.rpc_client.get_balance(&self.keypair.pubkey())
-            .map_err(|e| ElisymError::Payment(format!("Failed to check account balance: {e}")))?;
-        if balance > 0 {
-            return Ok(());
-        }
-
-        // New account — check rent-exempt minimum (cached)
-        let rent_min = self.get_rent_exempt_minimum()?;
-
-        if provider_net < rent_min {
-            return Err(ElisymError::Payment(format!(
-                "Price too low: after {} protocol fee the provider receives {} lamports, \
-                 below rent-exempt minimum ({} lamports). Account does not exist yet.",
-                crate::types::format_bps_percent(crate::types::PROTOCOL_FEE_BPS),
-                provider_net,
-                rent_min
-            )));
-        }
-        Ok(())
     }
 
     /// Shared logic for creating a payment request, with optional fee.

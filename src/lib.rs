@@ -104,6 +104,7 @@ pub use payment::ldk::{LdkPaymentProvider, LdkPaymentConfig, ChannelInfo};
 pub use payment::solana::{
     SolanaPaymentProvider, SolanaPaymentConfig, SolanaNetwork,
     PROTOCOL_TREASURY, validate_protocol_fee,
+    RENT_EXEMPT_MINIMUM, validate_job_price,
 };
 
 use std::sync::Arc;
