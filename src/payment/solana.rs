@@ -356,50 +356,6 @@ impl SolanaPaymentProvider {
         self.create_payment_request_with_fee(amount, description, expiry_secs, PROTOCOL_TREASURY, fee_amount)
     }
 
-    /// Send SOL directly to an address — **not** a protocol job payment.
-    ///
-    /// This method bypasses protocol fee validation and recipient checks because
-    /// it is intended for user-initiated direct transfers (e.g., `elisym send`),
-    /// not for paying job invoices.
-    ///
-    /// For job payments, use [`pay_validated`] or the [`PaymentProvider::pay`] trait method.
-    pub fn send_sol(&self, recipient: &str, lamports: u64) -> Result<PaymentResult> {
-        if lamports == 0 {
-            return Err(ElisymError::Payment("Send amount must be greater than 0".into()));
-        }
-        let recipient_pubkey: Pubkey = recipient
-            .parse()
-            .map_err(|e| ElisymError::Payment(format!("Invalid recipient address: {e:?}")))?;
-
-        let recent_blockhash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .map_err(|e| ElisymError::Payment(format!("Failed to get blockhash: {e}")))?;
-
-        #[allow(deprecated)]
-        let ix = solana_sdk::system_instruction::transfer(
-            &self.keypair.pubkey(),
-            &recipient_pubkey,
-            lamports,
-        );
-        let message = Message::new_with_blockhash(
-            &[ix],
-            Some(&self.keypair.pubkey()),
-            &recent_blockhash,
-        );
-        let tx = Transaction::new(&[&self.keypair], message, recent_blockhash);
-
-        let sig = self
-            .rpc_client
-            .send_and_confirm_transaction(&tx)
-            .map_err(|e| ElisymError::Payment(format!("Transaction failed: {e}")))?;
-
-        Ok(PaymentResult {
-            payment_id: sig.to_string(),
-            status: "confirmed".to_string(),
-        })
-    }
-
     /// Request an airdrop of SOL (devnet/testnet only).
     pub fn request_airdrop(&self, lamports: u64) -> Result<String> {
         let sig = self
@@ -528,7 +484,6 @@ impl SolanaPaymentProvider {
         let reference_keypair = Keypair::new();
         let reference = reference_keypair.pubkey();
 
-        let protocol_fee = fee.as_ref().map(|(_, amt)| *amt);
         let (fee_address, fee_amount) = match fee {
             Some((addr, amt)) => (Some(addr), Some(amt)),
             None => (None, None),
@@ -581,7 +536,6 @@ impl SolanaPaymentProvider {
             amount,
             currency_unit: "lamport".to_string(),
             request,
-            fee_amount: protocol_fee,
         })
     }
 }

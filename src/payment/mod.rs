@@ -49,9 +49,6 @@ pub struct PaymentRequest {
     pub currency_unit: String,
     /// The payment request string (BOLT11 invoice, Solana address, etc.).
     pub request: String,
-    /// Protocol fee included in this request (if any). Populated by
-    /// `create_payment_request_with_protocol_fee()` / `create_payment_request_with_fee()`.
-    pub fee_amount: Option<u64>,
 }
 
 /// Result of initiating a payment.

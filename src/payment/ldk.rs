@@ -96,7 +96,6 @@ impl PaymentProvider for LdkPaymentProvider {
             amount,
             currency_unit: "msat".to_string(),
             request: invoice.to_string(),
-            fee_amount: None,
         })
     }
 
