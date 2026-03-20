@@ -94,6 +94,11 @@ impl DiscoveryService {
         card: &CapabilityCard,
         supported_job_kinds: &[u16],
     ) -> Result<EventId> {
+        if card.payment.is_none() {
+            return Err(crate::error::ElisymError::InvalidCapabilityCard(
+                "payment info is required to publish a capability card".into(),
+            ));
+        }
         let content = card.to_json()?;
         let pubkey_hex = self.identity.public_key().to_hex();
 
