@@ -13,6 +13,12 @@ pub const KIND_JOB_RESULT_BASE: u16 = 6000;
 /// NIP-90 Data Vending Machine job feedback kind
 pub const KIND_JOB_FEEDBACK: u16 = 7000;
 
+/// Ephemeral ping event kind (not stored by relays, forwarded in real-time).
+pub const KIND_PING: u16 = 20200;
+
+/// Ephemeral pong event kind (not stored by relays, forwarded in real-time).
+pub const KIND_PONG: u16 = 20201;
+
 /// Default NIP-90 job kind offset (request kind = 5000 + offset, result kind = 6000 + offset)
 pub const DEFAULT_KIND_OFFSET: u16 = 100;
 
@@ -21,6 +27,8 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.nostr.band",
+    "wss://relay.primal.net",
+    "wss://relay.snort.social",
 ];
 
 /// Protocol fee in basis points (300 = 3%).

@@ -6,6 +6,7 @@ use crate::Subscription;
 use crate::dedup::{BoundedDedup, recv_notification, DEDUP_CAPACITY};
 use crate::error::Result;
 use crate::identity::AgentIdentity;
+use crate::types::{KIND_PING, KIND_PONG};
 /// A received private message.
 #[derive(Debug, Clone)]
 pub struct PrivateMessage {
@@ -94,7 +95,6 @@ impl MessagingService {
                                 }
                             }
                             Err(e) => {
-                                // Expected for gift wraps not addressed to us
                                 tracing::trace!(error = %e, "Could not unwrap gift wrap (not for us)");
                             }
                         }
@@ -107,32 +107,40 @@ impl MessagingService {
         Ok(Subscription::new(rx, handle))
     }
 
-    // ── NIP-17 gift-wrapped ping/pong ──
+    // ── Ephemeral ping/pong (kind 20200/20201) ──
 
-    /// Send a gift-wrapped ping to an agent.
+    /// Send an ephemeral ping to an agent.
+    /// Best-effort: ephemeral events may not get relay OK acknowledgment.
     pub async fn send_ping(
         &self,
         agent_pubkey: &PublicKey,
         nonce: &str,
     ) -> Result<()> {
         let content = serde_json::json!({"type": "elisym_ping", "nonce": nonce}).to_string();
-        self.client.send_private_msg(*agent_pubkey, content, []).await?;
+        let builder = EventBuilder::new(Kind::from(KIND_PING), &content)
+            .tag(Tag::public_key(*agent_pubkey));
+        let _ = self.client.send_event_builder(builder).await;
         Ok(())
     }
 
-    /// Send a gift-wrapped pong response.
+    /// Send an ephemeral pong response.
+    /// Best-effort: logs but does not fail on relay rejection (common for ephemeral events).
     pub async fn send_pong(
         &self,
         recipient_pubkey: &PublicKey,
         nonce: &str,
     ) -> Result<()> {
         let content = serde_json::json!({"type": "elisym_pong", "nonce": nonce}).to_string();
-        self.client.send_private_msg(*recipient_pubkey, content, []).await?;
+        let builder = EventBuilder::new(Kind::from(KIND_PONG), &content)
+            .tag(Tag::public_key(*recipient_pubkey));
+        if let Err(e) = self.client.send_event_builder(builder).await {
+            tracing::trace!(error = %e, "Pong relay rejection (expected for ephemeral events)");
+        }
         Ok(())
     }
 
     /// Ping an agent and wait for pong. Returns true if online.
-    /// Uses NIP-17 gift wraps. `since: now - 2 days` for NIP-59 timestamp randomization.
+    /// Uses ephemeral events - no `since` filter needed (nothing stored).
     pub async fn ping_agent(&self, agent_pubkey: &PublicKey, timeout_secs: u64) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -145,31 +153,37 @@ impl MessagingService {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
 
-        // Subscribe to gift wraps BEFORE sending ping
-        let since = Timestamp::from(Timestamp::now().as_u64().saturating_sub(2 * 24 * 60 * 60));
+        // Subscribe to ephemeral pongs BEFORE sending ping (no `since` - nothing stored)
         let filter = Filter::new()
-            .kind(Kind::GiftWrap)
-            .pubkey(self.identity.public_key())
-            .since(since);
+            .kind(Kind::from(KIND_PONG))
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::P),
+                vec![self.identity.public_key().to_hex()],
+            );
         let mut notifications = self.client.notifications();
         let sub_output = self.client.subscribe(vec![filter], None).await?;
 
-        // Send gift-wrapped ping
+        // Send ephemeral ping
         self.send_ping(agent_pubkey, &nonce).await?;
 
-        let client = self.client.clone();
+        let my_pk_hex = self.identity.public_key().to_hex();
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         let result = tokio::time::timeout(timeout, async {
             while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind != Kind::GiftWrap { continue; }
-                    if let Ok(unwrapped) = client.unwrap_gift_wrap(&event).await {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&unwrapped.rumor.content) {
-                            if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_pong")
-                                && parsed.get("nonce").and_then(|v| v.as_str()) == Some(&nonce)
-                            {
-                                return true;
-                            }
+                    if event.kind != Kind::from(KIND_PONG) { continue; }
+                    let targeted = event.tags.iter().any(|t| {
+                        let s = t.as_slice();
+                        s.first().map(|v| v.as_str()) == Some("p")
+                            && s.get(1).map(|v| v.as_str()) == Some(my_pk_hex.as_str())
+                    });
+                    if !targeted { continue; }
+                    if event.pubkey != *agent_pubkey { continue; }
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
+                        if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_pong")
+                            && parsed.get("nonce").and_then(|v| v.as_str()) == Some(&nonce)
+                        {
+                            return true;
                         }
                     }
                 }
@@ -184,42 +198,45 @@ impl MessagingService {
         Ok(result)
     }
 
-    /// Subscribe to incoming gift-wrapped pings addressed to this agent.
+    /// Subscribe to incoming ephemeral pings addressed to this agent.
     /// Returns a subscription yielding `(sender_pubkey, nonce)` pairs.
-    /// Uses `since: now - 2 days` for NIP-59 timestamp randomization.
+    /// No `since` filter - ephemeral events are never stored by relays.
     pub async fn subscribe_to_pings(&self) -> Result<Subscription<(PublicKey, String)>> {
         let (tx, rx) = mpsc::channel(256);
 
-        let since = Timestamp::from(Timestamp::now().as_u64().saturating_sub(2 * 24 * 60 * 60));
         let filter = Filter::new()
-            .kind(Kind::GiftWrap)
-            .pubkey(self.identity.public_key())
-            .since(since);
+            .kind(Kind::from(KIND_PING))
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::P),
+                vec![self.identity.public_key().to_hex()],
+            );
 
         let mut notifications = self.client.notifications();
         self.client.subscribe(vec![filter], None).await?;
 
-        let client = self.client.clone();
+        let my_pk_hex = self.identity.public_key().to_hex();
         let handle = tokio::spawn(async move {
             let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
             while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind != Kind::GiftWrap { continue; }
+                    if event.kind != Kind::from(KIND_PING) { continue; }
                     if !seen.insert(event.id) { continue; }
 
-                    match client.unwrap_gift_wrap(&event).await {
-                        Ok(unwrapped) => {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&unwrapped.rumor.content) {
-                                if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_ping") {
-                                    if let Some(nonce) = parsed.get("nonce").and_then(|v| v.as_str()) {
-                                        if tx.send((unwrapped.sender, nonce.to_string())).await.is_err() {
-                                            break;
-                                        }
-                                    }
+                    let targeted = event.tags.iter().any(|t| {
+                        let s = t.as_slice();
+                        s.first().map(|v| v.as_str()) == Some("p")
+                            && s.get(1).map(|v| v.as_str()) == Some(my_pk_hex.as_str())
+                    });
+                    if !targeted { continue; }
+
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
+                        if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_ping") {
+                            if let Some(nonce) = parsed.get("nonce").and_then(|v| v.as_str()) {
+                                if tx.send((event.pubkey, nonce.to_string())).await.is_err() {
+                                    break;
                                 }
                             }
                         }
-                        Err(_) => { /* not for us */ }
                     }
                 }
             }
