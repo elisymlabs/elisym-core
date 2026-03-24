@@ -13,9 +13,6 @@ pub const KIND_JOB_RESULT_BASE: u16 = 6000;
 /// NIP-90 Data Vending Machine job feedback kind
 pub const KIND_JOB_FEEDBACK: u16 = 7000;
 
-/// NIP-17 DM kind used for unencrypted ping/pong (no gift-wrap).
-pub const KIND_DM: u16 = 14;
-
 /// Default NIP-90 job kind offset (request kind = 5000 + offset, result kind = 6000 + offset)
 pub const DEFAULT_KIND_OFFSET: u16 = 100;
 
