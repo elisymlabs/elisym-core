@@ -6,7 +6,7 @@ use crate::Subscription;
 use crate::dedup::{BoundedDedup, recv_notification, DEDUP_CAPACITY};
 use crate::error::Result;
 use crate::identity::AgentIdentity;
-use crate::types::{KIND_PING, KIND_PONG};
+use crate::types::KIND_DM;
 
 /// A received private message.
 #[derive(Debug, Clone)]
@@ -109,35 +109,36 @@ impl MessagingService {
         Ok(Subscription::new(rx, handle))
     }
 
-    // ── Ephemeral ping/pong (kind 20100/20101) ──
+    // ── NIP-17 ping/pong (kind 14, unencrypted) ──
 
-    /// Send a ping to an agent. The event is ephemeral (not stored by relays).
+    /// Send a ping to an agent (kind 14, type "elisym_ping").
     pub async fn send_ping(
         &self,
         agent_pubkey: &PublicKey,
         nonce: &str,
     ) -> Result<()> {
-        let content = serde_json::json!({"nonce": nonce}).to_string();
-        let builder = EventBuilder::new(Kind::from(KIND_PING), &content)
+        let content = serde_json::json!({"type": "elisym_ping", "nonce": nonce}).to_string();
+        let builder = EventBuilder::new(Kind::from(KIND_DM), &content)
             .tag(Tag::public_key(*agent_pubkey));
         self.client.send_event_builder(builder).await?;
         Ok(())
     }
 
-    /// Send a pong response to a ping sender.
+    /// Send a pong response to a ping sender (kind 14, type "elisym_pong").
     pub async fn send_pong(
         &self,
         recipient_pubkey: &PublicKey,
         nonce: &str,
     ) -> Result<()> {
-        let content = serde_json::json!({"nonce": nonce}).to_string();
-        let builder = EventBuilder::new(Kind::from(KIND_PONG), &content)
+        let content = serde_json::json!({"type": "elisym_pong", "nonce": nonce}).to_string();
+        let builder = EventBuilder::new(Kind::from(KIND_DM), &content)
             .tag(Tag::public_key(*recipient_pubkey));
         self.client.send_event_builder(builder).await?;
         Ok(())
     }
 
     /// Ping an agent and wait for pong. Returns true if online.
+    /// No `since` filter — fresh identity per call means zero historical noise.
     pub async fn ping_agent(&self, agent_pubkey: &PublicKey, timeout_secs: u64) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -150,14 +151,13 @@ impl MessagingService {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
 
-        // Subscribe to pongs BEFORE sending ping
+        // Subscribe to pongs BEFORE sending ping — no `since` (fresh identity = no noise)
         let filter = Filter::new()
-            .kind(Kind::from(KIND_PONG))
+            .kind(Kind::from(KIND_DM))
             .custom_tag(
                 SingleLetterTag::lowercase(Alphabet::P),
                 vec![self.identity.public_key().to_hex()],
-            )
-            .since(Timestamp::now());
+            );
         let mut notifications = self.client.notifications();
         let sub_output = self.client.subscribe(vec![filter], None).await?;
 
@@ -169,7 +169,7 @@ impl MessagingService {
         let result = tokio::time::timeout(timeout, async {
             while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind != Kind::from(KIND_PONG) { continue; }
+                    if event.kind != Kind::from(KIND_DM) { continue; }
                     if event.pubkey != *agent_pubkey { continue; }
                     let targeted = event.tags.iter().any(|t| {
                         let s = t.as_slice();
@@ -178,7 +178,9 @@ impl MessagingService {
                     });
                     if !targeted { continue; }
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
-                        if parsed.get("nonce").and_then(|v| v.as_str()) == Some(&nonce) {
+                        if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_pong")
+                            && parsed.get("nonce").and_then(|v| v.as_str()) == Some(&nonce)
+                        {
                             return true;
                         }
                     }
@@ -196,16 +198,19 @@ impl MessagingService {
 
     /// Subscribe to incoming ping events addressed to this agent.
     /// Returns a subscription yielding `(sender_pubkey, nonce)` pairs.
+    /// Uses `since: now - 60s` to avoid replaying old pings on reconnect
+    /// while tolerating clock skew.
     pub async fn subscribe_to_pings(&self) -> Result<Subscription<(PublicKey, String)>> {
         let (tx, rx) = mpsc::channel(256);
 
+        let since = Timestamp::from(Timestamp::now().as_u64().saturating_sub(60));
         let filter = Filter::new()
-            .kind(Kind::from(KIND_PING))
+            .kind(Kind::from(KIND_DM))
             .custom_tag(
                 SingleLetterTag::lowercase(Alphabet::P),
                 vec![self.identity.public_key().to_hex()],
             )
-            .since(Timestamp::now());
+            .since(since);
 
         let mut notifications = self.client.notifications();
         self.client.subscribe(vec![filter], None).await?;
@@ -215,7 +220,7 @@ impl MessagingService {
             let mut seen = BoundedDedup::new(DEDUP_CAPACITY);
             while let Some(notification) = recv_notification(&mut notifications).await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind != Kind::from(KIND_PING) { continue; }
+                    if event.kind != Kind::from(KIND_DM) { continue; }
                     if !seen.insert(event.id) { continue; }
 
                     // Check "p" tag matches us
@@ -226,11 +231,13 @@ impl MessagingService {
                     });
                     if !targeted { continue; }
 
-                    // Parse nonce from content
+                    // Parse type + nonce from content
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
-                        if let Some(nonce) = parsed.get("nonce").and_then(|v| v.as_str()) {
-                            if tx.send((event.pubkey, nonce.to_string())).await.is_err() {
-                                break;
+                        if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_ping") {
+                            if let Some(nonce) = parsed.get("nonce").and_then(|v| v.as_str()) {
+                                if tx.send((event.pubkey, nonce.to_string())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                     }

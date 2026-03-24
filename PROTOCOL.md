@@ -351,13 +351,13 @@ elisym does not define a schema for private message content — it's application
 
 ### 6. Ping/Pong
 
-Lightweight liveness check using regular (stored) Nostr events. Events are stored by relays, ensuring reliable delivery even during brief connection interruptions.
+Lightweight liveness check using NIP-17 kind `14` events (sent without gift-wrap). Ping and pong are distinguished by the `type` field in the JSON content.
 
-**Ping — Kind:** `5200`
+**Kind:** `14` (both ping and pong)
 
-**Pong — Kind:** `5201`
-
-**Content (both):** `{"nonce": "<unique-string>"}`
+**Content:**
+- Ping: `{"type": "elisym_ping", "nonce": "<unique-string>"}`
+- Pong: `{"type": "elisym_pong", "nonce": "<unique-string>"}`
 
 **Tags (both):**
 
@@ -370,25 +370,29 @@ Lightweight liveness check using regular (stored) Nostr events. Events are store
 ```
 Sender                            Relay                           Target
   │                                │                                │
-  │  SUB: kind:5201, #p=sender     │                                │
+  │  SUB: kind:14, #p=sender       │                                │
   │───────────────────────────────>│                                │
   │                                │                                │
-  │  kind:5200 (ping)              │                                │
-  │  {"nonce": "abc123"}           │                                │
+  │  kind:14 (elisym_ping)         │                                │
+  │  {"type":"elisym_ping",        │                                │
+  │   "nonce":"abc123"}            │                                │
   │───────────────────────────────>│───────────────────────────────>│
   │                                │                                │
-  │                                │  kind:5201 (pong)              │
-  │                                │  {"nonce": "abc123"}           │
+  │                                │  kind:14 (elisym_pong)         │
+  │                                │  {"type":"elisym_pong",        │
+  │                                │   "nonce":"abc123"}            │
   │<───────────────────────────────│<───────────────────────────────│
   │                                │                                │
-  │  (nonce matches → agent is     │                                │
-  │   online, unsubscribe)         │                                │
+  │  (type + nonce match → agent   │                                │
+  │   is online, unsubscribe)      │                                │
 ```
 
 **Notes:**
-- The sender MUST subscribe to pong events before sending the ping to avoid missing the response.
-- The nonce is used to match a pong to its originating ping. It does not need to be cryptographically random — timestamp + counter is sufficient for liveness checks.
+- The sender MUST subscribe to kind:14 events before sending the ping to avoid missing the response.
+- The `type` field distinguishes ping from pong. The `nonce` matches a pong to its originating ping.
+- The nonce does not need to be cryptographically random — timestamp + counter is sufficient for liveness checks.
 - If no matching pong is received within the timeout, the target is considered offline or unreachable.
+- Events are sent without NIP-59 gift-wrap for simplicity and to allow public liveness observation.
 
 ## Message Flow
 
