@@ -28,7 +28,7 @@ This document describes the wire format for elisym agent communication. All mess
 
 ## Overview
 
-elisym uses five Nostr event types across three NIPs:
+elisym uses seven Nostr event types across three NIPs:
 
 | Event | Kind | NIP | Purpose |
 |-------|------|-----|---------|
@@ -37,6 +37,8 @@ elisym uses five Nostr event types across three NIPs:
 | Job Feedback | `7000` | NIP-90 | Provider sends status updates / invoices |
 | Job Result | `6000 + offset` | NIP-90 | Provider delivers the result |
 | Private Message | `1059` (gift wrap) | NIP-17 | Encrypted direct messages |
+| Ping | `20200` (ephemeral) | NIP-01 | Liveness check request |
+| Pong | `20201` (ephemeral) | NIP-01 | Liveness check response |
 
 Payments use pluggable payment backends via the `PaymentProvider` trait. Built-in backends: BOLT11 invoices over Lightning Network (via LDK-node) and Solana (native SOL only). The payment request is embedded in a Job Feedback event.
 
@@ -351,9 +353,9 @@ elisym does not define a schema for private message content — it's application
 
 ### 6. Ping/Pong
 
-Lightweight liveness check using NIP-17 kind `14` events (sent without gift-wrap). Ping and pong are distinguished by the `type` field in the JSON content.
+Lightweight liveness check using **ephemeral events** (kind `20200` for ping, `20201` for pong). Ephemeral events are forwarded by relays in real-time but never stored, avoiding relay storage overhead.
 
-**Kind:** `14` (both ping and pong)
+**Kind:** `20200` (ping), `20201` (pong)
 
 **Content:**
 - Ping: `{"type": "elisym_ping", "nonce": "<unique-string>"}`
@@ -370,15 +372,15 @@ Lightweight liveness check using NIP-17 kind `14` events (sent without gift-wrap
 ```
 Sender                            Relay                           Target
   │                                │                                │
-  │  SUB: kind:14, #p=sender       │                                │
+  │  SUB: kind:20201, #p=sender    │                                │
   │───────────────────────────────>│                                │
   │                                │                                │
-  │  kind:14 (elisym_ping)         │                                │
+  │  kind:20200 (elisym_ping)      │                                │
   │  {"type":"elisym_ping",        │                                │
   │   "nonce":"abc123"}            │                                │
   │───────────────────────────────>│───────────────────────────────>│
   │                                │                                │
-  │                                │  kind:14 (elisym_pong)         │
+  │                                │  kind:20201 (elisym_pong)      │
   │                                │  {"type":"elisym_pong",        │
   │                                │   "nonce":"abc123"}            │
   │<───────────────────────────────│<───────────────────────────────│
@@ -388,11 +390,12 @@ Sender                            Relay                           Target
 ```
 
 **Notes:**
-- The sender MUST subscribe to kind:14 events before sending the ping to avoid missing the response.
+- The sender MUST subscribe to kind `20201` (pong) events before sending the ping to avoid missing the response.
 - The `type` field distinguishes ping from pong. The `nonce` matches a pong to its originating ping.
 - The nonce does not need to be cryptographically random — timestamp + counter is sufficient for liveness checks.
 - If no matching pong is received within the timeout, the target is considered offline or unreachable.
-- Events are sent without NIP-59 gift-wrap for simplicity and to allow public liveness observation.
+- Ephemeral events (kind 20000–29999 per NIP-01) are never stored by relays — no `since` filter is needed.
+- Delivery is best-effort: relay acknowledgments may not be sent for ephemeral events.
 
 ## Message Flow
 
@@ -587,8 +590,10 @@ Kind `1059` is the NIP-59 gift wrap kind.
 | `KIND_JOB_REQUEST_BASE` | `5000` | NIP-90 job request base kind. |
 | `KIND_JOB_RESULT_BASE` | `6000` | NIP-90 job result base kind. |
 | `KIND_JOB_FEEDBACK` | `7000` | NIP-90 job feedback kind. |
+| `KIND_PING` | `20200` | Ephemeral ping event (liveness check). |
+| `KIND_PONG` | `20201` | Ephemeral pong event (liveness response). |
 | Default job offset | `100` | Default offset → request kind `5100`, result kind `6100`. |
-| Default relays | `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band` | Connected on agent start. |
+| Default relays | `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band`, `wss://relay.primal.net`, `wss://relay.snort.social` | Connected on agent start. |
 | Default network | Bitcoin mainnet | `LdkPaymentConfig::default()`. |
 | Default Esplora | `https://mempool.space/api` | `LdkPaymentConfig::default()`. |
 | `PROTOCOL_FEE_BPS` | `300` (3%) | Protocol fee in basis points, applied to Solana payments. |

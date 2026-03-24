@@ -245,7 +245,7 @@ Elisym uses standard Nostr NIPs — no custom event kinds:
 | Job Result | `6000+offset` | NIP-90 | Provider delivers result. `["e", request_id]`, `["amount", msat]`. |
 | Private Message | `1059` | NIP-17 | Encrypted DMs (NIP-44 + NIP-59 gift wrap). |
 
-Default relays: `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band`. Default job kind offset: `100` (kind `5100`/`6100`).
+Default relays: `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band`, `wss://relay.primal.net`, `wss://relay.snort.social`. Default job kind offset: `100` (kind `5100`/`6100`).
 
 **Full specification with JSON examples, tag reference tables, and message flows: [PROTOCOL.md](PROTOCOL.md)**
 
