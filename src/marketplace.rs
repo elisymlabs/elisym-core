@@ -640,14 +640,23 @@ impl MarketplaceService {
         payment_request: Option<&str>,
         payment_chain: Option<&str>,
     ) -> Result<EventId> {
+        let t_kind = TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::T));
         let mut tags = vec![
             Tag::event(request_event.id),
             Tag::public_key(request_event.pubkey),
-            Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::T)),
-                vec!["elisym".to_string()],
-            ),
+            Tag::custom(t_kind.clone(), vec!["elisym".to_string()]),
         ];
+
+        // Forward capability #t tags from the original request event
+        for tag in request_event.tags.iter() {
+            if tag.kind() == t_kind {
+                if let Some(val) = tag.content() {
+                    if val != "elisym" {
+                        tags.push(Tag::custom(t_kind.clone(), vec![val.to_string()]));
+                    }
+                }
+            }
+        }
 
         let status_str = status.to_string();
         if let Some(info) = extra_info {
