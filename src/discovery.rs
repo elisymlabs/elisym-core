@@ -40,6 +40,10 @@ pub struct AgentFilter {
     /// Free-text query to match against agent name and description (case-insensitive substring).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// Filter by a specific agent's public key. When set, the relay query
+    /// is scoped to events authored by this key (via `Filter::authors`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<PublicKey>,
 }
 
 /// Minimum token length for fuzzy prefix matching (both direct and reverse).
@@ -269,6 +273,10 @@ impl DiscoveryService {
             SingleLetterTag::lowercase(Alphabet::T),
             vec!["elisym".to_string()],
         );
+
+        if let Some(pubkey) = filter.pubkey {
+            f = f.author(pubkey);
+        }
 
         if let Some(job_kind) = filter.job_kind {
             f = f.custom_tag(
