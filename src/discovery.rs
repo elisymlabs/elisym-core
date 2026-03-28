@@ -42,11 +42,23 @@ pub struct AgentFilter {
     pub query: Option<String>,
 }
 
+/// Minimum token length for fuzzy prefix matching (both direct and reverse).
+/// Tokens shorter than this only match via exact equality.
+const MIN_FUZZY_PREFIX_LEN: usize = 4;
+
+/// Check if two lowercase tokens fuzzy-match: exact equality, or one is a prefix
+/// of the other (both tokens must be at least [`MIN_FUZZY_PREFIX_LEN`] chars).
+fn tokens_match(a: &str, b: &str) -> bool {
+    a == b
+        || (a.len() >= MIN_FUZZY_PREFIX_LEN && b.starts_with(a))
+        || (b.len() >= MIN_FUZZY_PREFIX_LEN && a.starts_with(b))
+}
+
 /// Check if a single query capability matches any of the event's tags.
 ///
 /// Matching is fuzzy: both the query and tags are split on delimiters (`-`, `_`, ` `)
 /// into tokens. A query token matches a tag token if they are equal or one is a prefix
-/// of the other (min 3 chars).
+/// of the other (min [`MIN_FUZZY_PREFIX_LEN`] chars).
 fn matches_capability(query_cap: &str, event_tags: &HashSet<&str>) -> bool {
     // Exact match first (fast path)
     if event_tags.contains(query_cap) {
@@ -62,12 +74,27 @@ fn matches_capability(query_cap: &str, event_tags: &HashSet<&str>) -> bool {
         let qt_lower = qt.to_lowercase();
         event_tags.iter().any(|tag| {
             tag.split(['-', '_', ' ']).any(|tt| {
-                let tt_lower = tt.to_lowercase();
-                tt_lower == qt_lower
-                    || (qt_lower.len() >= 3 && tt_lower.starts_with(&qt_lower))
-                    || (tt_lower.len() >= 3 && qt_lower.starts_with(&tt_lower))
+                tokens_match(&qt_lower, &tt.to_lowercase())
             })
         })
+    })
+}
+
+/// Check if a query capability fuzzy-matches tokens in a free-text field (name or description).
+/// Uses the same tokenization and prefix logic as `matches_capability`.
+fn matches_capability_in_text(query_cap: &str, text: &str) -> bool {
+    let query_tokens: Vec<&str> = query_cap
+        .split(['-', '_', ' '])
+        .filter(|t| !t.is_empty())
+        .collect();
+    if query_tokens.is_empty() {
+        return false;
+    }
+    query_tokens.iter().all(|qt| {
+        let qt_lower = qt.to_lowercase();
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .any(|tt| tokens_match(&qt_lower, &tt.to_lowercase()))
     })
 }
 
@@ -82,6 +109,28 @@ fn matches_query(query: &str, card: &CapabilityCard) -> bool {
             .capabilities
             .iter()
             .any(|c| c.to_lowercase().contains(&q))
+}
+
+/// Handle returned by [`DiscoveryService::start_heartbeat`].
+///
+/// Use `.stop()` for graceful shutdown (waits for the current tick to finish)
+/// or `.abort()` for immediate cancellation.
+pub struct HeartbeatHandle {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatHandle {
+    /// Signal the heartbeat to stop and wait for the task to finish.
+    pub async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.join_handle.await;
+    }
+
+    /// Immediately cancel the heartbeat task.
+    pub fn abort(self) {
+        self.join_handle.abort();
+    }
 }
 
 /// Service for publishing and discovering agent capabilities via NIP-89.
@@ -153,6 +202,51 @@ impl DiscoveryService {
         let output = self.client.set_metadata(&metadata).await?;
         tracing::info!(event_id = %output.val, "Updated Nostr profile (kind:0)");
         Ok(output.val)
+    }
+
+    /// Start a background heartbeat that republishes the capability card at `interval`
+    /// to keep `created_at` fresh on relays (NIP-89 replaceable event).
+    ///
+    /// When `skip_first_tick` is `true`, the first publish happens after `interval`
+    /// (use this when `publish_capability` was already called before starting the
+    /// heartbeat). When `false`, the card is published immediately on start.
+    ///
+    /// Returns a [`HeartbeatHandle`] — call `.stop()` for graceful shutdown or
+    /// `.abort()` for immediate cancellation.
+    pub fn start_heartbeat(
+        &self,
+        card: CapabilityCard,
+        supported_job_kinds: Vec<u16>,
+        interval: Duration,
+        skip_first_tick: bool,
+    ) -> HeartbeatHandle {
+        let discovery = self.clone();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let join_handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            if skip_first_tick {
+                ticker.tick().await; // consume the immediate first tick
+            }
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        match discovery
+                            .publish_capability(&card, &supported_job_kinds)
+                            .await
+                        {
+                            Ok(id) => {
+                                tracing::debug!(event_id = %id, "Heartbeat: republished capability card");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Heartbeat: failed to republish capability card");
+                            }
+                        }
+                    }
+                    _ = &mut shutdown_rx => break,
+                }
+            }
+        });
+        HeartbeatHandle { shutdown_tx, join_handle }
     }
 
     /// Search for agents matching the given filter.
@@ -301,7 +395,7 @@ impl DiscoveryService {
             }
         }
 
-        // Recompute all_tags and supported_kinds from surviving card entries,
+        // Recompute supported_kinds from surviving card entries,
         // then apply filters per-agent.
         let mut agents: Vec<DiscoveredAgent> = Vec::new();
         for (pubkey, mut acc) in agent_map {
@@ -312,8 +406,7 @@ impl DiscoveryService {
                 }
             }
 
-            // Collect tags and kinds only from the final (deduplicated) entries.
-            let all_tags: HashSet<String> = acc.entries.iter().flat_map(|e| e.tags.iter().cloned()).collect();
+            // Collect supported kinds from the final (deduplicated) entries.
             let mut supported_kinds: Vec<u16> = Vec::new();
             for e in &acc.entries {
                 for &k in &e.kinds {
@@ -326,16 +419,22 @@ impl DiscoveryService {
             let match_count = if filter.capabilities.is_empty() {
                 0
             } else {
-                let tag_refs: HashSet<&str> = all_tags.iter().map(|s| s.as_str()).collect();
-                let count = filter
-                    .capabilities
-                    .iter()
-                    .filter(|cap| matches_capability(cap, &tag_refs))
-                    .count();
-                if count == 0 {
+                // Per-card matching: for each card, count how many filter capabilities
+                // match via its tags OR its name/description. Use the best card's count.
+                let best = acc.entries.iter().map(|e| {
+                    let entry_tags: HashSet<&str> = e.tags.iter().map(|s| s.as_str()).collect();
+                    filter.capabilities.iter()
+                        .filter(|cap| {
+                            matches_capability(cap, &entry_tags)
+                                || matches_capability_in_text(cap, &e.card.name)
+                                || matches_capability_in_text(cap, &e.card.description)
+                        })
+                        .count()
+                }).max().unwrap_or(0);
+                if best == 0 {
                     continue;
                 }
-                count
+                best
             };
 
             // Sort cards by created_at descending (newest first) for deterministic order.
@@ -437,10 +536,31 @@ mod tests {
     }
 
     #[test]
-    fn test_short_token_no_fuzzy() {
-        // "ai" is < 3 chars, so it won't fuzzy-prefix-match "aim"
+    fn test_short_token_no_direct_prefix() {
+        // "ai" (2 chars < 4) won't fuzzy-prefix-match "aim"
         let tags: HashSet<&str> = ["aim"].into();
         assert!(!matches_capability("ai", &tags));
+    }
+
+    #[test]
+    fn test_short_token_no_reverse_prefix() {
+        // "cat" (3 chars < 4) in tags won't reverse-prefix-match "category" query
+        let tags: HashSet<&str> = ["cat"].into();
+        assert!(!matches_capability("category", &tags));
+    }
+
+    #[test]
+    fn test_direct_prefix_at_threshold() {
+        // "summ" (4 chars >= 4) direct-prefix-matches "summarization"
+        let tags: HashSet<&str> = ["summarization"].into();
+        assert!(matches_capability("summ", &tags));
+    }
+
+    #[test]
+    fn test_reverse_prefix_at_threshold() {
+        // "stock" (5 chars >= 4) in tags reverse-prefix-matches "stocks"
+        let tags: HashSet<&str> = ["stock"].into();
+        assert!(matches_capability("stocks", &tags));
     }
 
     #[test]
@@ -454,6 +574,60 @@ mod tests {
     fn test_empty_tags_no_match() {
         let tags: HashSet<&str> = HashSet::new();
         assert!(!matches_capability("translation", &tags));
+    }
+
+    // ── matches_capability_in_text ──
+
+    #[test]
+    fn test_capability_in_text_name_match() {
+        assert!(matches_capability_in_text("stock", "Stock Price Analyzer"));
+    }
+
+    #[test]
+    fn test_capability_in_text_compound_match() {
+        assert!(matches_capability_in_text(
+            "stock-analysis",
+            "Performs stock market analysis"
+        ));
+    }
+
+    #[test]
+    fn test_capability_in_text_no_match() {
+        assert!(!matches_capability_in_text("translation", "Stock Price Analyzer"));
+    }
+
+    #[test]
+    fn test_capability_in_text_prefix_match() {
+        assert!(matches_capability_in_text("summar", "Text Summarization Service"));
+    }
+
+    #[test]
+    fn test_capability_in_text_short_token_no_direct_prefix() {
+        // "ai" (2 chars < 4) won't fuzzy-prefix-match "aim"
+        assert!(!matches_capability_in_text("ai", "aim helper"));
+    }
+
+    #[test]
+    fn test_capability_in_text_no_reverse_prefix_short() {
+        // "cat" (3 chars < 4) in text won't reverse-prefix-match "category" query
+        assert!(!matches_capability_in_text("category", "cat image generator"));
+    }
+
+    #[test]
+    fn test_capability_in_text_direct_prefix_at_threshold() {
+        // "summ" (4 chars >= 4) direct-prefix-matches "summarization"
+        assert!(matches_capability_in_text("summ", "summarization service"));
+    }
+
+    #[test]
+    fn test_capability_in_text_reverse_prefix_at_threshold() {
+        // "stock" (5 chars >= 4) in text reverse-prefix-matches "stocks" query
+        assert!(matches_capability_in_text("stocks", "stock price analyzer"));
+    }
+
+    #[test]
+    fn test_capability_in_text_empty_query() {
+        assert!(!matches_capability_in_text("", "Some text"));
     }
 
     // ── matches_query ──
@@ -480,5 +654,57 @@ mod tests {
     fn test_query_no_match() {
         let card = CapabilityCard::new("Agent", "Does stuff", vec!["coding".into()]);
         assert!(!matches_query("translation", &card));
+    }
+
+    // ── search filter integration (simulates search_agents filtering logic) ──
+
+    /// Helper that replicates the combined tag + text matching from search_agents.
+    fn search_filter_matches(cap: &str, tags: &HashSet<&str>, card: &CapabilityCard) -> bool {
+        matches_capability(cap, tags)
+            || matches_capability_in_text(cap, &card.name)
+            || matches_capability_in_text(cap, &card.description)
+    }
+
+    #[test]
+    fn test_search_filter_text_fallback_name() {
+        // Tags don't contain "stock", but card name does.
+        let tags: HashSet<&str> = ["elisym", "finance"].into();
+        let card = CapabilityCard::new(
+            "Stock Price Analyzer",
+            "Provides market data",
+            vec!["finance".into()],
+        );
+        assert!(search_filter_matches("stock", &tags, &card));
+    }
+
+    #[test]
+    fn test_search_filter_text_fallback_description() {
+        // Tags don't match, but description does.
+        let tags: HashSet<&str> = ["elisym"].into();
+        let card = CapabilityCard::new(
+            "Market Agent",
+            "Performs deep analysis of market trends",
+            vec![],
+        );
+        assert!(search_filter_matches("analysis", &tags, &card));
+    }
+
+    #[test]
+    fn test_search_filter_no_match_anywhere() {
+        let tags: HashSet<&str> = ["elisym", "finance"].into();
+        let card = CapabilityCard::new(
+            "Stock Market Agent",
+            "Performs deep analysis of market trends",
+            vec!["finance".into()],
+        );
+        assert!(!search_filter_matches("translation", &tags, &card));
+    }
+
+    #[test]
+    fn test_search_filter_tag_match_sufficient() {
+        // Tag match alone is enough — text content is irrelevant.
+        let tags: HashSet<&str> = ["elisym", "stocks"].into();
+        let card = CapabilityCard::new("Unrelated Agent", "Does other things", vec![]);
+        assert!(search_filter_matches("stock", &tags, &card));
     }
 }

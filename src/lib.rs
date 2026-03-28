@@ -43,7 +43,7 @@ pub(crate) mod dedup;
 pub use error::{ElisymError, Result};
 pub use types::*;
 pub use identity::{AgentIdentity, CapabilityCard, PaymentInfo};
-pub use discovery::{DiscoveryService, DiscoveredAgent, AgentFilter, to_d_tag};
+pub use discovery::{DiscoveryService, DiscoveredAgent, AgentFilter, HeartbeatHandle, to_d_tag};
 pub use messaging::MessagingService;
 pub use marketplace::{MarketplaceService, JobRequest, JobResult, JobFeedback};
 pub use payment::{PaymentProvider, PaymentRequest, PaymentResult, PaymentStatus, PaymentChain};
