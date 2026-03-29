@@ -141,6 +141,11 @@ impl MessagingService {
 
     /// Ping an agent and wait for pong. Returns true if online.
     /// Uses ephemeral events - no `since` filter needed (nothing stored).
+    ///
+    /// Spawns a dedicated listener task that immediately starts draining the
+    /// broadcast channel, matching the TS SDK approach of callback-based
+    /// subscriptions. This prevents pong events from being lost due to
+    /// broadcast channel lag when other subscriptions are active.
     pub async fn ping_agent(&self, agent_pubkey: &PublicKey, timeout_secs: u64) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -153,49 +158,77 @@ impl MessagingService {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
 
-        // Subscribe to ephemeral pongs BEFORE sending ping (no `since` - nothing stored)
+        let my_pk_hex = self.identity.public_key().to_hex();
+        let target_pk = *agent_pubkey;
+        let nonce_for_listener = nonce.clone();
+
+        // Create broadcast receiver and immediately spawn a task to drain it.
+        // This avoids losing the pong to broadcast lag when the relay pool is busy.
+        let mut notifications = self.client.notifications();
+        let (found_tx, found_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let listener = tokio::spawn(async move {
+            loop {
+                match notifications.recv().await {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        if event.kind != Kind::from(KIND_PONG) { continue; }
+                        let targeted = event.tags.iter().any(|t| {
+                            let s = t.as_slice();
+                            s.first().map(|v| v.as_str()) == Some("p")
+                                && s.get(1).map(|v| v.as_str()) == Some(my_pk_hex.as_str())
+                        });
+                        if !targeted { continue; }
+                        if event.pubkey != target_pk { continue; }
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
+                            if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_pong")
+                                && parsed.get("nonce").and_then(|v| v.as_str()) == Some(&nonce_for_listener)
+                            {
+                                let _ = found_tx.send(());
+                                return;
+                            }
+                        }
+                    }
+                    // Lag means the pong could be among skipped events — potential false negative
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "Ping listener lagged — pong may have been missed (false negative possible)");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    _ => continue,
+                }
+            }
+        });
+
+        // Subscribe to ephemeral pongs (helps relays route events to us)
         let filter = Filter::new()
             .kind(Kind::from(KIND_PONG))
             .custom_tag(
                 SingleLetterTag::lowercase(Alphabet::P),
                 vec![self.identity.public_key().to_hex()],
             );
-        let mut notifications = self.client.notifications();
-        let sub_output = self.client.subscribe(vec![filter], None).await?;
+        let sub_output = match self.client.subscribe(vec![filter], None).await {
+            Ok(v) => v,
+            Err(e) => {
+                listener.abort();
+                return Err(e.into());
+            }
+        };
 
         // Send ephemeral ping
-        self.send_ping(agent_pubkey, &nonce).await?;
+        if let Err(e) = self.send_ping(agent_pubkey, &nonce).await {
+            listener.abort();
+            self.client.unsubscribe(sub_output.val).await;
+            return Err(e);
+        }
 
-        let my_pk_hex = self.identity.public_key().to_hex();
+        // Wait for pong or timeout
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
-        let result = tokio::time::timeout(timeout, async {
-            while let Some(notification) = recv_notification(&mut notifications).await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind != Kind::from(KIND_PONG) { continue; }
-                    let targeted = event.tags.iter().any(|t| {
-                        let s = t.as_slice();
-                        s.first().map(|v| v.as_str()) == Some("p")
-                            && s.get(1).map(|v| v.as_str()) == Some(my_pk_hex.as_str())
-                    });
-                    if !targeted { continue; }
-                    if event.pubkey != *agent_pubkey { continue; }
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
-                        if parsed.get("type").and_then(|v| v.as_str()) == Some("elisym_pong")
-                            && parsed.get("nonce").and_then(|v| v.as_str()) == Some(&nonce)
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
+        let result = tokio::time::timeout(timeout, found_rx).await;
 
+        listener.abort();
         self.client.unsubscribe(sub_output.val).await;
 
-        Ok(result)
+        Ok(result.is_ok_and(|r| r.is_ok()))
     }
 
     /// Subscribe to incoming ephemeral pings addressed to this agent.
